@@ -36,6 +36,13 @@ brew tap use-tusk/tap
 brew install use-tusk/tap/fence
 ```
 
+**NIX (macOS, Linux, Windows(WSL))**
+
+```sh
+nix run nixpkgs#fence -- --help
+```
+This runs it directly from the repository, without installing `fence`. If you want to install it, follow the guidelines [from NixOS](https://nix.dev) or [nix-darwin](https://github.com/nix-darwin/nix-darwin).
+
 <details>
 <summary>Other installation methods</summary>
 
