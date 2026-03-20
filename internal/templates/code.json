@@ -93,6 +93,9 @@
       // Factory CLI (droid)
       "~/.factory/**",
 
+      // Pi
+      "~/.pi/**",
+
       // Package manager caches
       "~/.npm/_cacache",
       "~/.cache",
