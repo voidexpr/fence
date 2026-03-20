@@ -190,8 +190,8 @@ To disable WSL interop explicitly: `"wslInterop": false`.
 
 | Field | Description |
 |-------|-------------|
-| `mode` | How `/dev` is set up inside the sandbox: `auto`, `minimal`, or `host` |
-| `allow` | Extra `/dev/...` paths to pass through when using a minimal `/dev` |
+| `mode` | How `/dev` is set up inside the sandbox: `auto`, `minimal`, or `host`. If omitted, fence behaves as if `auto` was set. |
+| `allow` | Extra `/dev/...` paths from the outer environment to pass through when using a minimal `/dev` |
 
 ### Device Modes
 
@@ -199,7 +199,7 @@ To disable WSL interop explicitly: `"wslInterop": false`.
 
 Creates a fresh minimal `/dev` inside the sandbox using `bwrap --dev /dev`.
 
-This is the most predictable and least-privileged mode. It includes standard essentials such as `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/shm`, and `devpts`.
+This is the most predictable and least-privileged mode. Fence starts from bubblewrap's synthetic `/dev` and preserves the standard core device nodes needed by common runtimes, including `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`, and `/dev/ptmx`. Bubblewrap's minimal `/dev` also provides essentials such as `/dev/shm` and `devpts`.
 
 Use this when you want sandbox behavior to be consistent across hosts and containers.
 
@@ -213,6 +213,8 @@ Use this only when you intentionally need the outer environment's full device tr
 
 Picks the safest compatible mode automatically.
 
+If `devices.mode` is omitted, fence behaves the same as `auto`.
+
 Current behavior:
 
 - Prefers `minimal` inside containers
@@ -223,7 +225,7 @@ If you need deterministic behavior, prefer setting `mode` explicitly instead of 
 
 ### Device Passthroughs
 
-When `mode` is `minimal`, you can opt specific host devices back in with `allow`:
+When `mode` is `minimal`, you can opt specific outer `/dev` paths back in with `allow`:
 
 ```json
 {
@@ -238,6 +240,8 @@ Rules:
 
 - Paths must be under `/dev/`
 - `"/dev"` itself is not allowed in `allow`; use `mode: "host"` if you want the full outer device tree
+- `allow` is only useful with `minimal`; in `host` mode the entire outer `/dev` is already available
+- You do not need to list standard core devices like `/dev/null` or `/dev/urandom`; they are already available in `minimal`
 - Missing device paths are skipped at runtime
 
 ### Choosing a Mode
