@@ -3,6 +3,8 @@
 <div align="center">
 
 ![GitHub Release](https://img.shields.io/github/v/release/Use-Tusk/fence)
+[![Build and test](https://github.com/Use-Tusk/fence/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/Use-Tusk/fence/actions/workflows/main.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 </div>
 
