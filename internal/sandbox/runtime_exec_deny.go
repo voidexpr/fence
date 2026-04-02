@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/Use-Tusk/fence/internal/config"
 )
@@ -92,8 +93,8 @@ func GetRuntimeDeniedExecutablePaths(cfg *config.Config) []string {
 
 // GetRuntimeDeniedExecutablePathsWithDiagnostics returns the list of executable paths to deny at
 // runtime, along with a diagnostics slice. Each diagnostic is formatted for the given debug
-// level: non-debug messages truncate the collision list to the first 3 items and hint at
-// --debug for the full list; debug messages show all collisions.
+// level: non-debug messages truncate the collision list to the first 3 critical commands and
+// hint at --debug for expanded details; debug messages show all detected relevant aliases.
 func GetRuntimeDeniedExecutablePathsWithDiagnostics(cfg *config.Config, debug bool) ([]string, []string) {
 	if cfg == nil {
 		return nil, nil
@@ -110,8 +111,8 @@ func GetRuntimeDeniedExecutablePathsWithDiagnostics(cfg *config.Config, debug bo
 	// itself being denied is not collateral damage — the user explicitly wants
 	// it blocked — and must not trigger the skip-with-warning path.
 	// Index by both the raw token and its basename. findSharedExecutableNames
-	// always returns bare filenames (entry.Name()), so an absolute-path deny
-	// entry like "/tmp/ls" must also be reachable as "ls" in the collision check.
+	// always returns bare filenames, so an absolute-path deny entry like
+	// "/tmp/ls" must also be reachable as "ls" in the collision check.
 	denyTokens := make(map[string]bool, len(denyRules)*2)
 	for _, rule := range denyRules {
 		if t, ok := runtimeExecutableToken(rule); ok {
@@ -120,37 +121,54 @@ func GetRuntimeDeniedExecutablePathsWithDiagnostics(cfg *config.Config, debug bo
 		}
 	}
 
-	var paths []string
-	var diagnostics []string
-	seen := make(map[string]bool)
-	sharedCache := make(map[string]sharedExecutableInfo)
+	type runtimeDeniedTarget struct {
+		token string
+		path  string
+	}
 
+	var targets []runtimeDeniedTarget
 	for _, rule := range denyRules {
 		token, ok := runtimeExecutableToken(rule)
 		if !ok {
 			continue
 		}
-
 		for _, resolved := range resolveExecutablePaths(token) {
-			if seen[resolved] {
-				continue
-			}
-			skip, reason := shouldSkipRuntimeExecDenyPath(
-				resolved, token,
-				cfg.Command.AcceptSharedBinaryCannotRuntimeDeny,
-				denyTokens,
-				sharedCache,
-				debug,
-			)
-			seen[resolved] = true
-			if reason != "" {
-				diagnostics = append(diagnostics, reason)
-			}
-			if skip {
-				continue
-			}
-			paths = append(paths, resolved)
+			targets = append(targets, runtimeDeniedTarget{token: token, path: resolved})
 		}
+	}
+
+	var resolvedPaths []string
+	for _, target := range targets {
+		resolvedPaths = append(resolvedPaths, target.path)
+	}
+	sharedSearch := newSharedExecutableSearch(resolvedPaths, runtimeExecSharedProbeNames(denyTokens))
+
+	var paths []string
+	var diagnostics []string
+	seen := make(map[string]bool)
+	sharedCache := make(map[string]sharedExecutableInfo)
+
+	for _, target := range targets {
+		if seen[target.path] {
+			continue
+		}
+		skip, reason := shouldSkipRuntimeExecDenyPathWithSearch(
+			target.path,
+			target.token,
+			cfg.Command.AcceptSharedBinaryCannotRuntimeDeny,
+			denyTokens,
+			sharedCache,
+			sharedSearch,
+			debug,
+		)
+		seen[target.path] = true
+		if reason != "" {
+			diagnostics = append(diagnostics, reason)
+		}
+		if skip {
+			continue
+		}
+		paths = append(paths, target.path)
 	}
 
 	slices.Sort(paths)
@@ -241,6 +259,15 @@ func resolveExecutablePaths(token string) []string {
 	return paths
 }
 
+func runtimeExecSharedProbeNames(denyTokens map[string]bool) []string {
+	probeNames := make([]string, 0, len(criticalCommands)+len(denyTokens))
+	probeNames = append(probeNames, criticalCommands...)
+	for token := range denyTokens {
+		probeNames = append(probeNames, token)
+	}
+	return sharedExecutableProbeNames(nil, probeNames)
+}
+
 type sharedExecutableInfo struct {
 	checked bool
 	shared  bool
@@ -255,7 +282,27 @@ func shouldSkipRuntimeExecDenyPath(
 	sharedCache map[string]sharedExecutableInfo,
 	debug bool,
 ) (bool, string) {
-	info := getSharedExecutableInfo(path, sharedCache)
+	return shouldSkipRuntimeExecDenyPathWithSearch(
+		path,
+		token,
+		acceptSharedBinaryCannotRuntimeDeny,
+		denyTokens,
+		sharedCache,
+		sharedExecutableSearch{},
+		debug,
+	)
+}
+
+func shouldSkipRuntimeExecDenyPathWithSearch(
+	path string,
+	token string,
+	acceptSharedBinaryCannotRuntimeDeny []string,
+	denyTokens map[string]bool,
+	sharedCache map[string]sharedExecutableInfo,
+	sharedSearch sharedExecutableSearch,
+	debug bool,
+) (bool, string) {
+	info := getSharedExecutableInfoWithSearch(path, sharedCache, sharedSearch)
 	if !info.shared {
 		return false, ""
 	}
@@ -295,11 +342,10 @@ func shouldSkipRuntimeExecDenyPath(
 	}
 
 	// Format the collision list.
-	// Non-debug: show the first maxShort critical names (highest priority first);
-	// the "+N more" count covers all remaining inode-sharers — not just critical
-	// ones — so the user sees the true blast radius.
-	// Debug: critical names first (priority order), then all other shared names
-	// appended alphabetically, with no repetitions.
+	// Non-debug: show the first maxShort critical names (highest priority first)
+	// and note if we detected additional aliases sharing the same binary.
+	// Debug: critical names first (priority order), then any other detected
+	// relevant aliases appended alphabetically, with no repetitions.
 	const maxShort = 3
 	var collisionSummary string
 	if debug {
@@ -324,12 +370,12 @@ func shouldSkipRuntimeExecDenyPath(
 		if len(shown) > maxShort {
 			shown = shown[:maxShort]
 		}
-		// remaining covers all other names sharing the inode minus the token
-		// itself and the names already shown in the excerpt.
+		// remaining covers all other detected aliases sharing the inode minus the
+		// token itself and the names already shown in the excerpt.
 		remaining := len(info.names) - 1 - len(shown)
 		collisionSummary = strings.Join(shown, " ")
 		if remaining > 0 {
-			collisionSummary = fmt.Sprintf("%s +%d more, use --debug for full list",
+			collisionSummary = fmt.Sprintf("%s +%d more detected aliases, use --debug for expanded details",
 				collisionSummary, remaining)
 		}
 	}
@@ -346,18 +392,22 @@ func shouldSkipRuntimeExecDenyPath(
 	)
 }
 
-func getSharedExecutableInfo(path string, sharedCache map[string]sharedExecutableInfo) sharedExecutableInfo {
+func getSharedExecutableInfoWithSearch(
+	path string,
+	sharedCache map[string]sharedExecutableInfo,
+	sharedSearch sharedExecutableSearch,
+) sharedExecutableInfo {
 	if cached, ok := sharedCache[path]; ok && cached.checked {
 		return cached
 	}
 
-	shared, names := findSharedExecutableNames(path)
+	shared, names := findSharedExecutableNamesWithSearch(path, sharedSearch)
 	info := sharedExecutableInfo{checked: true, shared: shared, names: names}
 	sharedCache[path] = info
 	return info
 }
 
-func executableSearchDirs(path string) []string {
+func executableSearchDirs(paths ...string) []string {
 	var dirs []string
 	seen := make(map[string]bool)
 	add := func(dir string) {
@@ -375,7 +425,12 @@ func executableSearchDirs(path string) []string {
 		dirs = append(dirs, dir)
 	}
 
-	add(filepath.Dir(path))
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		add(filepath.Dir(path))
+	}
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
 		add(dir)
 	}
@@ -385,32 +440,220 @@ func executableSearchDirs(path string) []string {
 	return dirs
 }
 
-func findSharedExecutableNames(path string) (bool, []string) {
+type sharedExecutableCandidate struct {
+	name string
+	info os.FileInfo
+}
+
+type sharedExecutableSearch struct {
+	candidatesByDevice map[uint64][]sharedExecutableCandidate
+	candidatesFallback []sharedExecutableCandidate
+}
+
+func sharedExecutableProbeNames(paths []string, probeNames []string) []string {
+	seen := make(map[string]bool, len(paths)+len(probeNames))
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(filepath.Base(name))
+		if name == "" || name == "." || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, path := range paths {
+		add(path)
+	}
+	for _, name := range probeNames {
+		add(name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func fileInfoDeviceID(info os.FileInfo) (uint64, bool) {
+	if info == nil {
+		return 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return 0, false
+	}
+	switch dev := any(stat.Dev).(type) {
+	case int:
+		if dev < 0 {
+			return 0, false
+		}
+		return uint64(dev), true
+	case int8:
+		if dev < 0 {
+			return 0, false
+		}
+		return uint64(dev), true
+	case int16:
+		if dev < 0 {
+			return 0, false
+		}
+		return uint64(dev), true
+	case int32:
+		if dev < 0 {
+			return 0, false
+		}
+		return uint64(dev), true
+	case int64:
+		if dev < 0 {
+			return 0, false
+		}
+		return uint64(dev), true
+	case uint:
+		return uint64(dev), true
+	case uint8:
+		return uint64(dev), true
+	case uint16:
+		return uint64(dev), true
+	case uint32:
+		return uint64(dev), true
+	case uint64:
+		return dev, true
+	case uintptr:
+		return uint64(dev), true
+	default:
+		return 0, false
+	}
+}
+
+func addSharedExecutableCandidate(search *sharedExecutableSearch, candidate sharedExecutableCandidate) {
+	if dev, ok := fileInfoDeviceID(candidate.info); ok {
+		if search.candidatesByDevice == nil {
+			search.candidatesByDevice = make(map[uint64][]sharedExecutableCandidate)
+		}
+		search.candidatesByDevice[dev] = append(search.candidatesByDevice[dev], candidate)
+		return
+	}
+	search.candidatesFallback = append(search.candidatesFallback, candidate)
+}
+
+func sharedExecutableTargetDevices(paths []string) map[uint64]bool {
+	targetDevices := make(map[uint64]bool)
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if dev, ok := fileInfoDeviceID(info); ok {
+			targetDevices[dev] = true
+		}
+	}
+	return targetDevices
+}
+
+func shouldFullyProbeSearchDir(dir string, targetDevices map[uint64]bool) bool {
+	if len(targetDevices) == 0 {
+		return true
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return true
+	}
+	dev, ok := fileInfoDeviceID(info)
+	if !ok {
+		return true
+	}
+	return targetDevices[dev]
+}
+
+func probeSharedExecutableCandidate(candidatePath string, fullProbe bool, targetDevices map[uint64]bool) (os.FileInfo, bool) {
+	if fullProbe {
+		info, err := os.Stat(candidatePath)
+		if err != nil || info.IsDir() {
+			return nil, false
+		}
+		return info, true
+	}
+
+	info, err := os.Lstat(candidatePath)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return nil, false
+	}
+
+	resolvedInfo, err := os.Stat(candidatePath)
+	if err != nil || resolvedInfo.IsDir() {
+		return nil, false
+	}
+	if dev, ok := fileInfoDeviceID(resolvedInfo); ok && len(targetDevices) > 0 && !targetDevices[dev] {
+		return nil, false
+	}
+	return resolvedInfo, true
+}
+
+func (s sharedExecutableSearch) candidatesForTarget(targetInfo os.FileInfo) []sharedExecutableCandidate {
+	if dev, ok := fileInfoDeviceID(targetInfo); ok {
+		bucket := s.candidatesByDevice[dev]
+		if len(s.candidatesFallback) == 0 {
+			return bucket
+		}
+		candidates := make([]sharedExecutableCandidate, 0, len(bucket)+len(s.candidatesFallback))
+		candidates = append(candidates, bucket...)
+		candidates = append(candidates, s.candidatesFallback...)
+		return candidates
+	}
+
+	total := len(s.candidatesFallback)
+	for _, bucket := range s.candidatesByDevice {
+		total += len(bucket)
+	}
+	candidates := make([]sharedExecutableCandidate, 0, total)
+	for _, bucket := range s.candidatesByDevice {
+		candidates = append(candidates, bucket...)
+	}
+	candidates = append(candidates, s.candidatesFallback...)
+	return candidates
+}
+
+func newSharedExecutableSearch(paths []string, probeNames []string) sharedExecutableSearch {
+	candidateNames := sharedExecutableProbeNames(paths, probeNames)
+	if len(candidateNames) == 0 {
+		return sharedExecutableSearch{}
+	}
+
+	targetDevices := sharedExecutableTargetDevices(paths)
+	search := sharedExecutableSearch{}
+	seenPaths := make(map[string]bool)
+	for _, dir := range executableSearchDirs(paths...) {
+		fullProbe := shouldFullyProbeSearchDir(dir, targetDevices)
+		for _, name := range candidateNames {
+			candidatePath := filepath.Join(dir, name)
+			if seenPaths[candidatePath] {
+				continue
+			}
+			seenPaths[candidatePath] = true
+
+			info, ok := probeSharedExecutableCandidate(candidatePath, fullProbe, targetDevices)
+			if !ok {
+				continue
+			}
+			addSharedExecutableCandidate(&search, sharedExecutableCandidate{name: name, info: info})
+		}
+	}
+	return search
+}
+
+func findSharedExecutableNames(path string, probeNames ...string) (bool, []string) {
+	return findSharedExecutableNamesWithSearch(path, newSharedExecutableSearch([]string{path}, probeNames))
+}
+
+func findSharedExecutableNamesWithSearch(path string, sharedSearch sharedExecutableSearch) (bool, []string) {
 	targetInfo, err := os.Stat(path)
 	if err != nil {
 		return false, nil
 	}
 
 	nameSet := make(map[string]bool)
-	for _, dir := range executableSearchDirs(path) {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
+	for _, candidate := range sharedSearch.candidatesForTarget(targetInfo) {
+		if !os.SameFile(targetInfo, candidate.info) {
 			continue
 		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			candidate := filepath.Join(dir, entry.Name())
-			candidateInfo, err := os.Stat(candidate)
-			if err != nil {
-				continue
-			}
-			if !os.SameFile(targetInfo, candidateInfo) {
-				continue
-			}
-			nameSet[entry.Name()] = true
-		}
+		nameSet[candidate.name] = true
 	}
 
 	names := make([]string, 0, len(nameSet))
