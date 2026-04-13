@@ -21,7 +21,9 @@ fence -t code npm install  # → uses 'code' template with npm/pypi/etc allowed
 fence -c "rm -rf /"  # → blocked by command deny rules
 ```
 
-![Fence Banner](assets/demo.gif)
+<p align="center">
+    <img src="assets/demo.gif" alt="Fence Claude Code demo" width="800">
+</p>
 
 Fence is also a permission manager for your CLI agents. **Works with popular coding agents like Claude Code, Codex, Amp, Gemini CLI, GitHub Copilot, OpenCode, Factory (Droid) CLI, and many more** - see [agents.md](./docs/agents.md).
 
