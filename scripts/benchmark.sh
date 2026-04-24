@@ -222,6 +222,37 @@ else
 fi
 
 # ============================================================================
+# Amortized (agent-style) benchmarks
+# ============================================================================
+#
+# These measure the "parent fence wrapping N child tool calls" scenario that
+# long-running agents (Claude Code, Cursor, Codex) actually use. Compared
+# against per-invocation mode, the interesting number is:
+#
+#   per_call_overhead = (sandboxed_total - unsandboxed_total) / N
+#
+# which is the real marginal cost of a tool call under fence.
+
+echo -e "${YELLOW}=== Amortized (N tool calls per outer fence) ===${NC}"
+echo ""
+
+run_bench "amortized-true-10" \
+    --command-name "unsandboxed" "bash -c 'for i in \$(seq 1 10); do true; done'" \
+    --command-name "sandboxed" "$FENCE_BIN -s $SETTINGS_FILE -- bash -c 'for i in \$(seq 1 10); do true; done'"
+
+if [[ "$QUICK" == "false" ]]; then
+    run_bench "amortized-true-100" \
+        --command-name "unsandboxed" "bash -c 'for i in \$(seq 1 100); do true; done'" \
+        --command-name "sandboxed" "$FENCE_BIN -s $SETTINGS_FILE -- bash -c 'for i in \$(seq 1 100); do true; done'"
+fi
+
+if command -v git &> /dev/null && [[ -d .git ]]; then
+    run_bench "amortized-gitstatus-10" \
+        --command-name "unsandboxed" "bash -c 'for i in \$(seq 1 10); do git status --porcelain >/dev/null; done'" \
+        --command-name "sandboxed" "$FENCE_BIN -s $SETTINGS_FILE -- bash -c 'for i in \$(seq 1 10); do git status --porcelain >/dev/null; done'"
+fi
+
+# ============================================================================
 # File I/O benchmarks
 # ============================================================================
 
@@ -235,6 +266,47 @@ run_bench "file-write" \
 run_bench "file-read" \
     --command-name "unsandboxed" "cat $WORKSPACE/test.txt >/dev/null" \
     --command-name "sandboxed" "$FENCE_BIN -s $SETTINGS_FILE -c 'cat $WORKSPACE/test.txt' >/dev/null"
+
+# ============================================================================
+# WSL runtime-deny sentinel (tracks PR #98 regression surface)
+# ============================================================================
+#
+# On WSL, the runtime exec deny resolver used to do an exhaustive PATH scan
+# including /mnt/c/** which stalled startup to multi-second latency. PR #98
+# replaced that with bounded, device-bucketed probing. This workload exists
+# so regressions in that code path show up as a direct timing delta on WSL.
+#
+# Runs on Linux only (including WSL). On non-WSL Linux the numbers are still
+# useful as a baseline for the same code path.
+
+if [[ "$OS" == "Linux" ]]; then
+    echo -e "${YELLOW}=== Runtime Exec Deny Benchmarks ===${NC}"
+    echo ""
+
+    # Sentinel deny config: names that collide with busybox / coreutils
+    # multicall binaries are what exercises the shared-binary alias probing
+    # path most heavily.
+    DENY_SETTINGS="$WORKSPACE/fence-deny.json"
+    cat > "$DENY_SETTINGS" << EOF
+{
+  "command": {
+    "deny": ["curl", "wget", "nc", "ssh", "ls", "cat", "cp", "mv"],
+    "useDefaults": true
+  },
+  "filesystem": {
+    "allowWrite": ["$WORKSPACE", "."]
+  }
+}
+EOF
+
+    run_bench "runtime-deny-startup" \
+        --command-name "unsandboxed" "true" \
+        --command-name "sandboxed" "$FENCE_BIN -s $DENY_SETTINGS -- true"
+
+    if [[ -d /mnt/c ]]; then
+        echo -e "${BLUE}  (detected WSL: /mnt/c present)${NC}"
+    fi
+fi
 
 # ============================================================================
 # Monitor mode benchmarks (optional)
@@ -337,30 +409,60 @@ cat > "$RESULTS_MD" << EOF
 |-----------|-------------|-----------|----------|
 EOF
 
-# Parse results and add to markdown (run in subshell to prevent failures from stopping script)
+# Parse results and add to markdown.
+#
+# Formatting rules:
+# - Times are rendered in milliseconds to 3 decimal places.
+# - The overhead column is intentionally suppressed ("—") when the
+#   unsandboxed baseline is sub-millisecond. The ratio in that regime
+#   (e.g. 142 ms / 0.01 ms = 14000x) is dominated by fixed startup cost
+#   and tells you nothing useful. Read the absolute columns instead.
 if command -v jq &> /dev/null; then
     for json_file in "$WORKSPACE"/*.json; do
         [[ -f "$json_file" ]] || continue
         name=$(basename "$json_file" .json)
-        
+
         # Extract mean times, defaulting to empty if not found
         unsandboxed=$(jq -r '.results[] | select(.command == "unsandboxed") | .mean // empty' "$json_file" 2>/dev/null) || true
         sandboxed=$(jq -r '.results[] | select(.command == "sandboxed") | .mean // empty' "$json_file" 2>/dev/null) || true
-        
+
         # Skip if values are missing, null, or zero
         if [[ -z "$unsandboxed" || -z "$sandboxed" || "$unsandboxed" == "null" || "$sandboxed" == "null" ]]; then
             continue
         fi
-        
-        # Calculate values, catching any bc errors
-        overhead=$(echo "scale=1; $sandboxed / $unsandboxed" | bc 2>/dev/null) || continue
-        unsandboxed_ms=$(echo "scale=2; $unsandboxed * 1000" | bc 2>/dev/null) || continue
-        sandboxed_ms=$(echo "scale=2; $sandboxed * 1000" | bc 2>/dev/null) || continue
-        
-        if [[ -n "$overhead" && -n "$unsandboxed_ms" && -n "$sandboxed_ms" ]]; then
-            echo "| $name | ${unsandboxed_ms}ms | ${sandboxed_ms}ms | ${overhead}x |" >> "$RESULTS_MD"
+
+        # Convert to ms with fixed precision. bc's scale= only affects
+        # division, so post-format with printf to avoid spurious precision.
+        unsandboxed_ms=$(printf "%.3f" "$(echo "$unsandboxed * 1000" | bc -l 2>/dev/null)") || continue
+        sandboxed_ms=$(printf "%.3f" "$(echo "$sandboxed * 1000" | bc -l 2>/dev/null)") || continue
+
+        # Gate overhead on the raw baseline (not the rounded ms value):
+        # sub-millisecond baselines produce misleading ratios (see comment
+        # above). Comparing the rounded value here would misclassify
+        # anything in [0.9995, 1.000) ms because printf "%.3f" rounds it up
+        # to 1.000.
+        if (( $(echo "$unsandboxed >= 0.001" | bc -l) )); then
+            overhead_raw=$(echo "scale=2; $sandboxed / $unsandboxed" | bc 2>/dev/null) || overhead_raw=""
+            if [[ -n "$overhead_raw" ]]; then
+                overhead="$(printf "%.1fx" "$overhead_raw")"
+            else
+                overhead="—"
+            fi
+        else
+            overhead="—"
         fi
+
+        echo "| $name | ${unsandboxed_ms} ms | ${sandboxed_ms} ms | ${overhead} |" >> "$RESULTS_MD"
     done
+
+    cat >> "$RESULTS_MD" << 'NOTE'
+
+Overhead column is suppressed ("—") when the unsandboxed baseline is
+under 1 ms — the ratio is dominated by fixed fence startup cost in that
+regime and tells you nothing about per-workload overhead. Read the
+absolute columns instead, or look at the `amortized-*` rows which
+bake many inner calls into a single measurement.
+NOTE
 fi
 
 echo ""
@@ -369,26 +471,34 @@ echo "  JSON: $RESULTS_JSON"
 echo "  Markdown: $RESULTS_MD"
 echo ""
 
-# Print quick summary (errors in this section should not fail the script)
+# Print quick summary (errors in this section should not fail the script).
+# Rows with a baseline >= 1 ms get the overhead ratio; sub-ms rows show
+# absolute ms instead to avoid misleading multipliers.
 if command -v jq &> /dev/null; then
-    echo -e "${BLUE}Quick Summary (overhead factors):${NC}"
+    echo -e "${BLUE}Quick Summary:${NC}"
     for json_file in "$WORKSPACE"/*.json; do
         (
             [[ -f "$json_file" ]] || exit 0
             name=$(basename "$json_file" .json)
-            
-            # Extract values, defaulting to empty if not found
+
             unsandboxed=$(jq -r '.results[] | select(.command == "unsandboxed") | .mean // empty' "$json_file" 2>/dev/null) || exit 0
             sandboxed=$(jq -r '.results[] | select(.command == "sandboxed") | .mean // empty' "$json_file" 2>/dev/null) || exit 0
-            
-            # Skip if either value is missing or null
+
             [[ -z "$unsandboxed" || -z "$sandboxed" || "$unsandboxed" == "null" || "$sandboxed" == "null" ]] && exit 0
-            
-            # Calculate overhead, catching any bc errors
-            overhead=$(echo "scale=1; $sandboxed / $unsandboxed" | bc 2>/dev/null) || exit 0
-            
-            [[ -n "$overhead" ]] && printf "  %-15s %sx\n" "$name:" "$overhead"
-        ) || true  # Ignore errors from subshell
+
+            unsandboxed_ms=$(printf "%.3f" "$(echo "$unsandboxed * 1000" | bc -l 2>/dev/null)") || exit 0
+            sandboxed_ms=$(printf "%.3f" "$(echo "$sandboxed * 1000" | bc -l 2>/dev/null)") || exit 0
+
+            # Gate on the raw baseline (not the rounded ms value) so
+            # values near the 1 ms boundary don't get misclassified by
+            # printf rounding.
+            if (( $(echo "$unsandboxed >= 0.001" | bc -l) )); then
+                overhead=$(echo "scale=1; $sandboxed / $unsandboxed" | bc 2>/dev/null) || exit 0
+                [[ -n "$overhead" ]] && printf "  %-28s %sx (baseline %s ms)\n" "$name:" "$overhead" "$unsandboxed_ms"
+            else
+                printf "  %-28s %s ms sandboxed (baseline %s ms, ratio not meaningful)\n" "$name:" "$sandboxed_ms" "$unsandboxed_ms"
+            fi
+        ) || true
     done
 fi
 
