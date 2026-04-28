@@ -38,6 +38,61 @@ func loadHookConfigDocument(path string, label string) (map[string]any, error) {
 	return doc, nil
 }
 
+// hookConfigHasJSONCComments reports whether the file at path contains JSONC
+// comments (line `//` or block `/* */`) that would be stripped on a structured
+// re-marshal. Returns false on a missing file. Trailing commas — also legal
+// in JSONC and also stripped on re-marshal — do not count as comments here;
+// the caller's warning is specifically about losing user-authored prose, not
+// about losing trailing commas the marshaller would re-add anyway.
+func hookConfigHasJSONCComments(path string) (bool, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // user-provided path is intentional
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return containsJSONCCommentBytes(data), nil
+}
+
+// containsJSONCCommentBytes scans data for an unescaped `//` line comment or
+// `/* */` block comment outside of any string literal. Backslash escaping
+// inside strings is honored, so comment sequences inside e.g. "x\\" or
+// "//not-a-comment" do not count.
+func containsJSONCCommentBytes(data []byte) bool {
+	var (
+		inString bool
+		escape   bool
+	)
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			if escape {
+				escape = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escape = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			continue
+		}
+		if c == '/' && i+1 < len(data) {
+			if data[i+1] == '/' || data[i+1] == '*' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func writeHookConfigDocument(path string, doc map[string]any, label string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return fmt.Errorf("failed to create %s directory: %w", label, err)
