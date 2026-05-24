@@ -406,15 +406,16 @@ func runCommand(cmd *cobra.Command, args []string) error {
 				if debug {
 					fencelog.Printf("[fence] Warning: failed to set child as foreground: %v\n", err)
 				}
-			}
-			defer func() {
-				_ = unix.IoctlSetPointerInt(stdinFd, unix.TIOCSPGRP, savedFgPgrp)
-				signal.Reset(syscall.SIGTTOU)
-			}()
+			} else {
+				defer func() {
+					_ = unix.IoctlSetPointerInt(stdinFd, unix.TIOCSPGRP, savedFgPgrp)
+					signal.Reset(syscall.SIGTTOU)
+				}()
 
-			jobControlEnabled = true
-			jobControlStdinFd = stdinFd
-			jobControlChildPgrp = childPgrp
+				jobControlEnabled = true
+				jobControlStdinFd = stdinFd
+				jobControlChildPgrp = childPgrp
+			}
 		}
 	}
 
