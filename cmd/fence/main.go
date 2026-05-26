@@ -402,6 +402,10 @@ func runCommand(cmd *cobra.Command, args []string) error {
 			}
 
 			signal.Ignore(syscall.SIGTTOU)
+			// Reset SIGTTOU on every exit path, including a failed TIOCSPGRP
+			// below. SIGTTOU disposition is process-wide, so leaving it ignored
+			// could mask later background terminal writes/ioctls.
+			defer signal.Reset(syscall.SIGTTOU)
 			if err := unix.IoctlSetPointerInt(stdinFd, unix.TIOCSPGRP, childPgrp); err != nil {
 				if debug {
 					fencelog.Printf("[fence] Warning: failed to set child as foreground: %v\n", err)
@@ -414,7 +418,6 @@ func runCommand(cmd *cobra.Command, args []string) error {
 					// back right before exit, leaving an empty foreground pgrp
 					// and causing the shell's next read to return EIO.
 					setForegroundIfOwner(stdinFd, childPgrp, savedFgPgrp)
-					signal.Reset(syscall.SIGTTOU)
 				}()
 
 				jobControlEnabled = true
