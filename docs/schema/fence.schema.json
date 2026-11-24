@@ -95,7 +95,7 @@
           "type": "boolean"
         },
         "allowRead": {
-          "description": "Additional filesystem paths the sandbox may read. Accepts absolute paths and glob patterns.",
+          "description": "Additional filesystem paths the sandbox may read. Accepts absolute paths and glob patterns. A literal path (no glob) strictly inside a denyRead entry stays readable.",
           "items": {
             "type": "string"
           },
@@ -113,7 +113,7 @@
           "type": "boolean"
         },
         "denyRead": {
-          "description": "Paths explicitly blocked from reading, even if they would otherwise be permitted by allowRead or system defaults.",
+          "description": "Paths blocked from reading, even if they would otherwise be permitted by allowRead or system defaults. A literal allowRead path strictly inside an entry reopens that path; a denyRead entry equal to or deeper than it still wins.",
           "items": {
             "type": "string"
           },

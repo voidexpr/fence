@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,6 +18,9 @@ const (
 	linuxLateMountReadOnly linuxLateMountKind = iota
 	linuxLateMountMaskFile
 	linuxLateMountMaskDir
+	// linuxLateMountReveal binds the real path read-only onto itself inside a
+	// masked directory (an allowRead carve-out).
+	linuxLateMountReveal
 )
 
 type linuxLateMount struct {
@@ -38,45 +42,14 @@ func (p *linuxLateMountPlanner) Add(path string, kind linuxLateMountKind) {
 		return
 	}
 
-	if p.hasStrictAncestor(path, linuxLateMountMaskDir) {
-		return
-	}
-
 	for i, existing := range p.mounts {
 		if existing.Path != path {
 			continue
 		}
-		if linuxLateMountPriority(existing.Kind) >= linuxLateMountPriority(kind) {
-			return
-		}
-
-		p.mounts[i].Kind = kind
-		switch kind {
-		case linuxLateMountMaskDir:
-			p.removeDescendants(path, func(mount linuxLateMount) bool {
-				return true
-			})
-		case linuxLateMountReadOnly:
-			p.removeDescendants(path, func(mount linuxLateMount) bool {
-				return mount.Kind == linuxLateMountReadOnly
-			})
+		if linuxLateMountPriority(kind) > linuxLateMountPriority(existing.Kind) {
+			p.mounts[i].Kind = kind
 		}
 		return
-	}
-
-	if kind == linuxLateMountReadOnly && p.hasStrictAncestor(path, linuxLateMountReadOnly) {
-		return
-	}
-
-	switch kind {
-	case linuxLateMountMaskDir:
-		p.removeDescendants(path, func(mount linuxLateMount) bool {
-			return true
-		})
-	case linuxLateMountReadOnly:
-		p.removeDescendants(path, func(mount linuxLateMount) bool {
-			return mount.Kind == linuxLateMountReadOnly
-		})
 	}
 
 	p.mounts = append(p.mounts, linuxLateMount{Path: path, Kind: kind})
@@ -87,29 +60,49 @@ func (p *linuxLateMountPlanner) hasStrictAncestor(path string, kind linuxLateMou
 		if mount.Kind != kind || mount.Path == path {
 			continue
 		}
-		if linuxPathContains(mount.Path, path) {
+		if pathContains(mount.Path, path) {
 			return true
 		}
 	}
 	return false
 }
 
-func (p *linuxLateMountPlanner) removeDescendants(path string, shouldRemove func(linuxLateMount) bool) {
-	filtered := p.mounts[:0]
-	for _, mount := range p.mounts {
-		if mount.Path != path && linuxPathContains(path, mount.Path) && shouldRemove(mount) {
+// hidden reports whether path sits in a masked directory with no reveal in
+// between: the closest ancestor that is a mask or a reveal is a mask.
+func (p *linuxLateMountPlanner) hidden(path string) bool {
+	closest := -1
+	for i, mount := range p.mounts {
+		if mount.Kind != linuxLateMountMaskDir && mount.Kind != linuxLateMountReveal {
 			continue
 		}
-		filtered = append(filtered, mount)
+		if mount.Path == path || !pathContains(mount.Path, path) {
+			continue
+		}
+		if closest < 0 || len(mount.Path) > len(p.mounts[closest].Path) {
+			closest = i
+		}
 	}
-	p.mounts = filtered
+	return closest >= 0 && p.mounts[closest].Kind == linuxLateMountMaskDir
 }
 
+// Mounts returns the planned mounts in emission order. Shallower paths come
+// first, so a reveal is emitted after the mask that covers it and a mask
+// nested in a reveal after that reveal. Mounts hidden by a masked directory
+// are dropped, except reveals, which are what puncture the mask.
 func (p *linuxLateMountPlanner) Mounts() []linuxLateMount {
-	mounts := slices.Clone(p.mounts)
+	var mounts []linuxLateMount
+	for _, mount := range p.mounts {
+		if mount.Kind != linuxLateMountReveal && p.hidden(mount.Path) {
+			continue
+		}
+		if mount.Kind == linuxLateMountReadOnly && p.hasStrictAncestor(mount.Path, linuxLateMountReadOnly) {
+			continue
+		}
+		mounts = append(mounts, mount)
+	}
 	slices.SortFunc(mounts, func(a, b linuxLateMount) int {
-		depthA := linuxLateMountDepth(a.Path)
-		depthB := linuxLateMountDepth(b.Path)
+		depthA := pathDepth(a.Path)
+		depthB := pathDepth(b.Path)
 		if depthA != depthB {
 			return depthA - depthB
 		}
@@ -125,7 +118,7 @@ func appendLinuxLateMounts(args []string, mounts []linuxLateMount) []string {
 			args = append(args, "--tmpfs", mount.Path)
 		case linuxLateMountMaskFile:
 			args = append(args, "--ro-bind", "/dev/null", mount.Path)
-		case linuxLateMountReadOnly:
+		case linuxLateMountReadOnly, linuxLateMountReveal:
 			args = append(args, "--ro-bind", mount.Path, mount.Path)
 		}
 	}
@@ -135,36 +128,16 @@ func appendLinuxLateMounts(args []string, mounts []linuxLateMount) []string {
 func linuxLateMountPriority(kind linuxLateMountKind) int {
 	switch kind {
 	case linuxLateMountMaskDir:
-		return 3
+		return 4
 	case linuxLateMountMaskFile:
+		return 3
+	case linuxLateMountReveal:
 		return 2
 	case linuxLateMountReadOnly:
 		return 1
 	default:
 		return 0
 	}
-}
-
-func linuxLateMountDepth(path string) int {
-	path = filepath.Clean(path)
-	trimmed := strings.Trim(path, string(filepath.Separator))
-	if trimmed == "" {
-		return 0
-	}
-	return strings.Count(trimmed, string(filepath.Separator)) + 1
-}
-
-func linuxPathContains(ancestor, path string) bool {
-	ancestor = filepath.Clean(ancestor)
-	path = filepath.Clean(path)
-
-	if ancestor == path {
-		return true
-	}
-	if ancestor == string(filepath.Separator) {
-		return strings.HasPrefix(path, string(filepath.Separator))
-	}
-	return strings.HasPrefix(path, ancestor+string(filepath.Separator))
 }
 
 func collectResolvedLinuxLateMountPaths(patterns []string) []string {
@@ -200,11 +173,12 @@ func hasExplicitLinuxReadGrant(cfg *config.Config, paths ...string) bool {
 		return false
 	}
 
+	policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
 	for _, path := range paths {
 		if path == "" {
 			continue
 		}
-		if _, denied := matchPathRule(path, cfg.Filesystem.DenyRead); denied {
+		if _, denied := policy.deniedBy(path); denied {
 			return false
 		}
 	}
@@ -228,7 +202,7 @@ func hasExplicitLinuxReadGrant(cfg *config.Config, paths ...string) bool {
 }
 
 func isLinuxSpecialReadSource(path string) bool {
-	return linuxPathContains("/dev", path) || linuxPathContains("/proc", path)
+	return pathContains("/dev", path) || pathContains("/proc", path)
 }
 
 func isLinuxRuntimeDeniedSource(path string, deniedExecPaths []string) bool {
@@ -247,6 +221,9 @@ func isLinuxRuntimeDeniedSource(path string, deniedExecPaths []string) bool {
 
 // appendLinuxLatePolicyMounts plans the final policy overlays with subtree-aware
 // precedence so masked directories cannot be punctured by later self-binds.
+// The one exception is an allowRead carve-out, which is revealed inside the
+// mask. A carve-out that is hidden by a mask and cannot be bound is an error:
+// starting without it would silently drop a path the config promises.
 func appendLinuxLatePolicyMounts(
 	bwrapArgs []string,
 	cfg *config.Config,
@@ -254,16 +231,34 @@ func appendLinuxLatePolicyMounts(
 	defaultDenyRead bool,
 	deniedExecPaths []string,
 	debug bool,
-) []string {
+) ([]string, error) {
 	planner := newLinuxLateMountPlanner()
 
 	if cfg != nil {
-		for _, mountPath := range collectResolvedLinuxLateMountPaths(cfg.Filesystem.DenyRead) {
-			if isDirectory(mountPath) {
-				planner.Add(mountPath, linuxLateMountMaskDir)
-			} else {
-				planner.Add(mountPath, linuxLateMountMaskFile)
+		policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
+		for _, pattern := range cfg.Filesystem.DenyRead {
+			rule, glob, ok := newReadRule(pattern)
+			for _, mountPath := range collectResolvedLinuxLateMountPaths([]string{pattern}) {
+				if ok && glob && policy.globReopenedAt(rule, mountPath) {
+					continue
+				}
+				if isDirectory(mountPath) {
+					planner.Add(mountPath, linuxLateMountMaskDir)
+				} else {
+					planner.Add(mountPath, linuxLateMountMaskFile)
+				}
 			}
+		}
+
+		for _, carve := range policy.carveOuts() {
+			if !planner.hasStrictAncestor(carve.path, linuxLateMountMaskDir) {
+				continue
+			}
+			mountPath, ok := resolvePathForMount(carve.path)
+			if !ok {
+				return nil, fmt.Errorf("allowRead %q is inside a denyRead directory but does not exist; Linux cannot re-expose a missing path", carve.raw)
+			}
+			planner.Add(mountPath, linuxLateMountReveal)
 		}
 	}
 
@@ -322,5 +317,5 @@ func appendLinuxLatePolicyMounts(
 		planner.Add(mountPath, linuxLateMountMaskFile)
 	}
 
-	return appendLinuxLateMounts(bwrapArgs, planner.Mounts())
+	return appendLinuxLateMounts(bwrapArgs, planner.Mounts()), nil
 }

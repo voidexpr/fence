@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fencesandbox/fence/internal/config"
 	"github.com/fencesandbox/fence/internal/sandbox"
 	"github.com/spf13/cobra"
 )
@@ -337,4 +338,48 @@ func TestUpsertEnv(t *testing.T) {
 			t.Fatalf("expected appended env entry, got %v", updated)
 		}
 	})
+}
+
+func TestApplyCLIConfigOverrides_ReadPathFlags(t *testing.T) {
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Bool("force-new-session", false, "")
+	cmd.Flags().StringArray("allow-read", nil, "")
+	cmd.Flags().StringArray("deny-read", nil, "")
+	args := []string{
+		"--deny-read", "~/.ssh",
+		"--allow-read", "~/.ssh/config",
+		"--allow-read", "~/.ssh/known_hosts",
+		"--deny-read", "/already/denied",
+	}
+	if err := cmd.ParseFlags(args); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.Filesystem.AllowRead = []string{"/opt/tools"}
+	cfg.Filesystem.DenyRead = []string{"/already/denied"}
+	cfg = applyCLIConfigOverrides(cmd, cfg, false)
+
+	wantAllow := []string{"/opt/tools", "~/.ssh/config", "~/.ssh/known_hosts"}
+	if !slices.Equal(cfg.Filesystem.AllowRead, wantAllow) {
+		t.Errorf("allowRead = %v, want %v", cfg.Filesystem.AllowRead, wantAllow)
+	}
+	wantDeny := []string{"/already/denied", "~/.ssh"}
+	if !slices.Equal(cfg.Filesystem.DenyRead, wantDeny) {
+		t.Errorf("denyRead = %v, want %v", cfg.Filesystem.DenyRead, wantDeny)
+	}
+}
+
+func TestApplyCLIConfigOverrides_ReadPathFlagsOnNilConfig(t *testing.T) {
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().StringArray("allow-read", nil, "")
+	cmd.Flags().StringArray("deny-read", nil, "")
+	if err := cmd.ParseFlags([]string{"--deny-read", "/secret"}); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+
+	cfg := applyCLIConfigOverrides(cmd, nil, false)
+	if !slices.Equal(cfg.Filesystem.DenyRead, []string{"/secret"}) {
+		t.Errorf("denyRead = %v, want [/secret]", cfg.Filesystem.DenyRead)
+	}
 }

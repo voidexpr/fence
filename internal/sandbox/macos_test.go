@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1214,5 +1215,151 @@ func TestWrapCommandMacOS_ExposedHostPathsSkipsMissing(t *testing.T) {
 	}
 	if !strings.Contains(cmd, escapePath(goodResolved)) {
 		t.Errorf("existing exposed host path %q should appear in seatbelt profile, got:\n%s", goodResolved, cmd)
+	}
+}
+
+// seatbeltReadVerdict evaluates generated read rules the way Seatbelt does:
+// the last rule matching the operation and path decides. It understands the
+// filters generateReadRules emits.
+func seatbeltReadVerdict(t *testing.T, rules []string, op, path string) bool {
+	t.Helper()
+	filterRe := regexp.MustCompile(`\((subpath|literal) ("(?:[^"\\]|\\.)*")\)|\(regex #"((?:[^"\\]|\\.)*)"\)`)
+	headRe := regexp.MustCompile(`^\((allow|deny) ([a-z*-]+)`)
+
+	var grouped []string
+	for _, line := range rules {
+		if strings.HasPrefix(line, "(") {
+			grouped = append(grouped, line)
+		} else {
+			grouped[len(grouped)-1] += "\n" + line
+		}
+	}
+
+	allowed := false
+	for _, rule := range grouped {
+		head := headRe.FindStringSubmatch(rule)
+		if head == nil {
+			t.Fatalf("unparsed rule: %s", rule)
+		}
+		if head[2] != op && head[2] != "file-read*" {
+			continue
+		}
+		matches := true
+		for _, filter := range filterRe.FindAllStringSubmatch(rule, -1) {
+			switch filter[1] {
+			case "subpath":
+				matches = matches && pathContains(mustUnquote(t, filter[2]), path)
+			case "literal":
+				matches = matches && mustUnquote(t, filter[2]) == path
+			default:
+				matches = matches && regexp.MustCompile(strings.ReplaceAll(filter[3], `\"`, `"`)).MatchString(path)
+			}
+		}
+		if matches {
+			allowed = head[1] == "allow"
+		}
+	}
+	return allowed
+}
+
+func mustUnquote(t *testing.T, quoted string) string {
+	t.Helper()
+	unquoted, err := strconv.Unquote(quoted)
+	if err != nil {
+		t.Fatalf("failed to unquote %s: %v", quoted, err)
+	}
+	return unquoted
+}
+
+func TestGenerateReadRules_CarveOuts(t *testing.T) {
+	root := newReadCarveOutTree(t)
+
+	for _, tc := range readCarveOutCases {
+		for _, defaultDenyRead := range []bool{false, true} {
+			name := tc.name + "/read-mostly"
+			if defaultDenyRead {
+				name = tc.name + "/defaultDenyRead"
+			}
+			t.Run(name, func(t *testing.T) {
+				fs := tc.filesystemConfig(root, defaultDenyRead)
+				rules := generateReadRules(defaultDenyRead, false, fs.AllowRead, fs.DenyRead, "tag")
+				for _, path := range joinAll(root, tc.readable) {
+					if !seatbeltReadVerdict(t, rules, "file-read-data", path) {
+						t.Errorf("expected profile to allow reading %s\n%s", path, strings.Join(rules, "\n"))
+					}
+				}
+				for _, path := range joinAll(root, tc.blocked) {
+					if seatbeltReadVerdict(t, rules, "file-read-data", path) {
+						t.Errorf("expected profile to deny reading %s\n%s", path, strings.Join(rules, "\n"))
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestGenerateReadRules_CarveOutRuleOrder(t *testing.T) {
+	root := newReadCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	rules := generateReadRules(false, false,
+		[]string{in("d/sub")},
+		[]string{in("d/sub/deep"), in("d")},
+		"tag",
+	)
+	profile := strings.Join(rules, "\n")
+
+	denyOuter := fmt.Sprintf("(deny file-read*\n  (subpath %s)", escapePath(in("d")))
+	allowCarve := fmt.Sprintf("(allow file-read*\n  (subpath %s))", escapePath(in("d/sub")))
+	denyInner := fmt.Sprintf("(deny file-read*\n  (subpath %s)", escapePath(in("d/sub/deep")))
+	statParent := fmt.Sprintf("(allow file-read-metadata\n  (literal %s))", escapePath(in("d")))
+
+	outerIdx := strings.Index(profile, denyOuter)
+	carveIdx := strings.Index(profile, allowCarve)
+	innerIdx := strings.LastIndex(profile, denyInner)
+	if outerIdx < 0 || carveIdx < 0 || innerIdx < 0 {
+		t.Fatalf("expected deny, carve-out and nested deny rules, got:\n%s", profile)
+	}
+	if outerIdx >= carveIdx || carveIdx >= innerIdx {
+		t.Errorf("expected order deny d < allow d/sub < deny d/sub/deep, got %d, %d, %d:\n%s", outerIdx, carveIdx, innerIdx, profile)
+	}
+	if !strings.Contains(profile, statParent) {
+		t.Errorf("expected the closed parent to stay stat-able, got:\n%s", profile)
+	}
+
+	// The closed parent must not become listable.
+	if seatbeltReadVerdict(t, rules, "file-read-data", in("d")) {
+		t.Errorf("closed parent must stay unreadable:\n%s", profile)
+	}
+	if !seatbeltReadVerdict(t, rules, "file-read-metadata", in("d")) {
+		t.Errorf("closed parent must be stat-able:\n%s", profile)
+	}
+
+	// Renaming the denied folder away must stay blocked.
+	if !strings.Contains(profile, fmt.Sprintf("(deny file-write-unlink\n  (subpath %s)", escapePath(in("d")))) {
+		t.Errorf("expected move-blocking rule for the denied folder, got:\n%s", profile)
+	}
+}
+
+func TestGenerateReadCarveOutRules_NoneWithoutCarveOut(t *testing.T) {
+	policy := newReadPolicy([]string{"/opt/tools", "/home/user/.ssh/*"}, []string{"/home/user/.ssh", "**/.env"})
+	if rules := generateReadCarveOutRules(policy, []string{"file-read*"}, "tag"); rules != nil {
+		t.Fatalf("expected no carve-out rules, got:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+// An exposed host path follows the allowRead rules on macOS: it reopens a
+// denied parent, and loses to a deny on the same path.
+func TestWrapCommandMacOS_ExposedHostPathIsACarveOut(t *testing.T) {
+	root := newReadCarveOutTree(t)
+	exposed := filepath.Join(root, "d", "f")
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{DenyRead: []string{filepath.Join(root, "d")}}}
+
+	cmd, err := WrapCommandMacOS(cfg, "true", "", 8080, 1080, nil, []exposedHostPath{{path: exposed}}, false, ShellModeDefault, false)
+	if err != nil {
+		t.Fatalf("WrapCommandMacOS: %v", err)
+	}
+	if !strings.Contains(cmd, fmt.Sprintf("(allow file-read*\n  (subpath %s))", escapePath(exposed))) {
+		t.Errorf("expected exposed path to be reopened inside the denied folder, got:\n%s", cmd)
 	}
 }

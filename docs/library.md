@@ -548,14 +548,18 @@ Semantics match wrap-mode enforcement:
 
 - **Writes**: mandatory dangerous-path protection, then `denyWrite`, then
   `allowWrite`, then default deny. An empty policy denies all writes.
-- **Reads**: `denyRead` always wins. Without `defaultDenyRead`, everything
-  else is readable. With `defaultDenyRead`, a path is readable when it
+- **Reads**: `denyRead` wins, unless a literal `allowRead` path strictly
+  inside the denied entry reopens it (the most specific literal path wins,
+  deny wins a tie; see
+  [Read precedence](configuration.md#read-precedence-and-carve-outs)).
+  Without `defaultDenyRead`, everything else is readable. With `defaultDenyRead`, a path is readable when it
   matches `allowRead`, `allowExecute`, `allowWrite` (which implies read), or
   a default readable system path - unless `strictDenyRead` suppresses the
   system paths.
 
-Caveats: paths are evaluated lexically (no symlink resolution of the
-target, no filesystem access), and only the config is consulted -
+Caveats: paths are evaluated lexically, except the `denyRead` step of
+`CheckReadPath`, which also checks the symlink-resolved path because that is
+what the sandbox enforces. Only the config is consulted -
 manager-level additions like `ExposeHostPath` are not reflected.
 
 ### Commands

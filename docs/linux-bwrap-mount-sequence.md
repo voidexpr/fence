@@ -265,6 +265,21 @@ Rules:
 Fence also records these paths so they take precedence over later mandatory
 dangerous-path protection.
 
+A literal `allowRead` path strictly inside a masked directory is a carve-out.
+Fence reveals it with `--ro-bind <path> <path>`, emitted after the `--tmpfs`
+that covers it. Mounts are ordered by path depth, so a `denyRead` entry nested
+inside a carve-out is masked again after the reveal:
+
+```text
+--tmpfs ~/.ssh
+--ro-bind ~/.ssh/keys ~/.ssh/keys
+--tmpfs ~/.ssh/keys/private
+```
+
+bwrap creates the missing parent directories of a reveal inside the tmpfs. A
+carve-out that does not exist at launch cannot be bound, so Fence refuses to
+start when its denied directory exists.
+
 ### 10. Mandatory Dangerous-Path Protection
 
 Fence next protects dangerous targets even if the user did not list them in
