@@ -594,3 +594,47 @@ func TestMacOS_MachWildcardAuthorizesNonBaselineService(t *testing.T) {
 		}
 	})
 }
+
+// TestMacOS_DenyReadGivenByLinkHidesTheLinkTarget verifies that excluding a
+// folder by its symlink also closes the link: readlink must not show where
+// the folder really is. A carve-out below the link must still work through
+// the link; in that case the target is visible again, because following a
+// link and readlink need the same permission.
+func TestMacOS_DenyReadGivenByLinkHidesTheLinkTarget(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	workspace := createTempWorkspace(t)
+	target := filepath.Join(workspace, "Sync", "ssh")
+	link := filepath.Join(workspace, "ssh")
+	createTestFile(t, target, "config", "carved content")
+	createTestFile(t, target, "id_key", "sibling content")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	for _, defaultDenyRead := range []bool{false, true} {
+		cfg := testConfigWithWorkspace(workspace)
+		cfg.Filesystem.DefaultDenyRead = defaultDenyRead
+		cfg.Filesystem.DenyRead = []string{link}
+		if defaultDenyRead {
+			cfg.Filesystem.AllowRead = []string{workspace}
+		}
+
+		result := runUnderSandbox(t, cfg, "readlink "+link, workspace)
+		if strings.Contains(result.Stdout, "Sync") {
+			t.Errorf("defaultDenyRead=%v: link target leaked: %q", defaultDenyRead, result.Stdout)
+		}
+		result = runUnderSandbox(t, cfg, "ls -l "+workspace, workspace)
+		if strings.Contains(result.Stdout, "Sync/ssh") {
+			t.Errorf("defaultDenyRead=%v: link target leaked through ls -l: %q", defaultDenyRead, result.Stdout)
+		}
+		assertBlocked(t, runUnderSandbox(t, cfg, "cat "+filepath.Join(link, "id_key"), workspace))
+
+		// With a carve-out the link must still be traversable.
+		cfg.Filesystem.AllowRead = append(cfg.Filesystem.AllowRead, filepath.Join(link, "config"))
+		result = runUnderSandbox(t, cfg, "cat "+filepath.Join(link, "config"), workspace)
+		assertAllowed(t, result)
+		assertContains(t, result.Stdout, "carved content")
+		assertBlocked(t, runUnderSandbox(t, cfg, "cat "+filepath.Join(link, "id_key"), workspace))
+	}
+}

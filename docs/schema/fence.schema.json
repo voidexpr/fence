@@ -102,7 +102,7 @@
           "type": "array"
         },
         "allowWrite": {
-          "description": "Filesystem paths the sandbox may write to. Accepts absolute paths and glob patterns.",
+          "description": "Filesystem paths the sandbox may write to. Accepts absolute paths and glob patterns. A literal path (no glob) strictly inside a denyWrite entry stays writable.",
           "items": {
             "type": "string"
           },
@@ -120,7 +120,7 @@
           "type": "array"
         },
         "denyWrite": {
-          "description": "Paths explicitly blocked from writing, even if they would otherwise be permitted by allowWrite.",
+          "description": "Paths blocked from writing, even if they would otherwise be permitted by allowWrite. A literal allowWrite path strictly inside an entry reopens that path; a denyWrite entry equal to or deeper than it still wins.",
           "items": {
             "type": "string"
           },

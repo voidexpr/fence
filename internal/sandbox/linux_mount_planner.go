@@ -21,6 +21,9 @@ const (
 	// linuxLateMountReveal binds the real path read-only onto itself inside a
 	// masked directory (an allowRead carve-out).
 	linuxLateMountReveal
+	// linuxLateMountWritable binds the real path read-write onto itself
+	// inside a read-only directory (an allowWrite carve-out).
+	linuxLateMountWritable
 )
 
 type linuxLateMount struct {
@@ -67,12 +70,12 @@ func (p *linuxLateMountPlanner) hasStrictAncestor(path string, kind linuxLateMou
 	return false
 }
 
-// hidden reports whether path sits in a masked directory with no reveal in
-// between: the closest ancestor that is a mask or a reveal is a mask.
-func (p *linuxLateMountPlanner) hidden(path string) bool {
+// closestAncestorKind returns the kind of the closest strict ancestor of path
+// that has one of kinds.
+func (p *linuxLateMountPlanner) closestAncestorKind(path string, kinds ...linuxLateMountKind) (linuxLateMountKind, bool) {
 	closest := -1
 	for i, mount := range p.mounts {
-		if mount.Kind != linuxLateMountMaskDir && mount.Kind != linuxLateMountReveal {
+		if !slices.Contains(kinds, mount.Kind) {
 			continue
 		}
 		if mount.Path == path || !pathContains(mount.Path, path) {
@@ -82,21 +85,30 @@ func (p *linuxLateMountPlanner) hidden(path string) bool {
 			closest = i
 		}
 	}
-	return closest >= 0 && p.mounts[closest].Kind == linuxLateMountMaskDir
+	if closest < 0 {
+		return 0, false
+	}
+	return p.mounts[closest].Kind, true
 }
 
 // Mounts returns the planned mounts in emission order. Shallower paths come
-// first, so a reveal is emitted after the mask that covers it and a mask
-// nested in a reveal after that reveal. Mounts hidden by a masked directory
-// are dropped, except reveals, which are what puncture the mask.
+// first, so a carve-out is emitted after the mount it punctures and a deny
+// nested in a carve-out after that carve-out. A mount is dropped when a
+// shallower one already decides its fate:
+//   - anything but a reveal inside a masked directory with no reveal in between
+//   - a read-only bind inside a read-only bind with no writable bind in between
 func (p *linuxLateMountPlanner) Mounts() []linuxLateMount {
 	var mounts []linuxLateMount
 	for _, mount := range p.mounts {
-		if mount.Kind != linuxLateMountReveal && p.hidden(mount.Path) {
-			continue
+		if mount.Kind != linuxLateMountReveal {
+			if kind, ok := p.closestAncestorKind(mount.Path, linuxLateMountMaskDir, linuxLateMountReveal); ok && kind == linuxLateMountMaskDir {
+				continue
+			}
 		}
-		if mount.Kind == linuxLateMountReadOnly && p.hasStrictAncestor(mount.Path, linuxLateMountReadOnly) {
-			continue
+		if mount.Kind == linuxLateMountReadOnly {
+			if kind, ok := p.closestAncestorKind(mount.Path, linuxLateMountReadOnly, linuxLateMountWritable); ok && kind == linuxLateMountReadOnly {
+				continue
+			}
 		}
 		mounts = append(mounts, mount)
 	}
@@ -120,6 +132,8 @@ func appendLinuxLateMounts(args []string, mounts []linuxLateMount) []string {
 			args = append(args, "--ro-bind", "/dev/null", mount.Path)
 		case linuxLateMountReadOnly, linuxLateMountReveal:
 			args = append(args, "--ro-bind", mount.Path, mount.Path)
+		case linuxLateMountWritable:
+			args = append(args, "--bind", mount.Path, mount.Path)
 		}
 	}
 	return args
@@ -128,12 +142,14 @@ func appendLinuxLateMounts(args []string, mounts []linuxLateMount) []string {
 func linuxLateMountPriority(kind linuxLateMountKind) int {
 	switch kind {
 	case linuxLateMountMaskDir:
-		return 4
+		return 5
 	case linuxLateMountMaskFile:
-		return 3
+		return 4
 	case linuxLateMountReveal:
-		return 2
+		return 3
 	case linuxLateMountReadOnly:
+		return 2
+	case linuxLateMountWritable:
 		return 1
 	default:
 		return 0
@@ -173,7 +189,7 @@ func hasExplicitLinuxReadGrant(cfg *config.Config, paths ...string) bool {
 		return false
 	}
 
-	policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
+	policy := newPathPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
 	for _, path := range paths {
 		if path == "" {
 			continue
@@ -221,9 +237,11 @@ func isLinuxRuntimeDeniedSource(path string, deniedExecPaths []string) bool {
 
 // appendLinuxLatePolicyMounts plans the final policy overlays with subtree-aware
 // precedence so masked directories cannot be punctured by later self-binds.
-// The one exception is an allowRead carve-out, which is revealed inside the
-// mask. A carve-out that is hidden by a mask and cannot be bound is an error:
-// starting without it would silently drop a path the config promises.
+// The exceptions are carve-outs: an allowRead path is revealed inside the mask
+// that covers it, and an allowWrite path is bound read-write inside a
+// denyWrite directory. A missing read carve-out is an error: starting without
+// it would silently drop a path the config promises. A missing write carve-out
+// only warns, like other missing write paths, and stays read-only.
 func appendLinuxLatePolicyMounts(
 	bwrapArgs []string,
 	cfg *config.Config,
@@ -235,9 +253,9 @@ func appendLinuxLatePolicyMounts(
 	planner := newLinuxLateMountPlanner()
 
 	if cfg != nil {
-		policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
+		policy := newPathPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
 		for _, pattern := range cfg.Filesystem.DenyRead {
-			rule, glob, ok := newReadRule(pattern)
+			rule, glob, ok := newPathRule(pattern)
 			for _, mountPath := range collectResolvedLinuxLateMountPaths([]string{pattern}) {
 				if ok && glob && policy.globReopenedAt(rule, mountPath) {
 					continue
@@ -301,8 +319,39 @@ func appendLinuxLatePolicyMounts(
 	}
 
 	if cfg != nil {
-		for _, mountPath := range collectResolvedLinuxLateMountPaths(cfg.Filesystem.DenyWrite) {
-			planner.Add(mountPath, linuxLateMountReadOnly)
+		policy := newPathPolicy(cfg.Filesystem.AllowWrite, cfg.Filesystem.DenyWrite)
+		var readOnly []string
+		for _, pattern := range cfg.Filesystem.DenyWrite {
+			rule, glob, ok := newPathRule(pattern)
+			for _, mountPath := range collectResolvedLinuxLateMountPaths([]string{pattern}) {
+				if ok && glob && policy.globReopenedAt(rule, mountPath) {
+					continue
+				}
+				planner.Add(mountPath, linuxLateMountReadOnly)
+				readOnly = append(readOnly, mountPath)
+			}
+		}
+
+		for _, carve := range policy.carveOuts() {
+			inDenyWrite := slices.ContainsFunc(readOnly, func(dir string) bool {
+				return dir != carve.path && pathContains(dir, carve.path)
+			})
+			if !inDenyWrite || linuxDedicatedWritableMount(carve.path) {
+				continue
+			}
+			// Mandatory dangerous-path protection is never reopened.
+			if _, dangerous := matchesDangerousPath(carve.path); dangerous {
+				continue
+			}
+			mountPath, ok := resolvePathForMount(carve.path)
+			if !ok {
+				// Fails safe: the path stays read-only. Warn regardless of
+				// debug, like a missing ExposeHostPath, because the caller
+				// expects to write there.
+				fencelog.Printf("[fence:linux] allowWrite %q is inside a denyWrite directory but does not exist; it will not be writable\n", carve.raw)
+				continue
+			}
+			planner.Add(mountPath, linuxLateMountWritable)
 		}
 	}
 

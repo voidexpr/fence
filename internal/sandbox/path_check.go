@@ -41,7 +41,9 @@ func (e *PathBlockedError) Error() string {
 // generators (macOS seatbelt, Linux landlock). Both consume cfg.Filesystem.*
 // plus DangerousFiles / DangerousDirectories, so a single fence.json behaves
 // the same in both modes: a write is allowed iff it matches allowWrite and
-// neither denyWrite nor a dangerous-path rule. allowWrite entries are exact
+// neither denyWrite nor a dangerous-path rule. A literal allowWrite entry
+// strictly inside a denyWrite entry reopens it (see pathPolicy); a dangerous
+// path is never reopened. allowWrite entries are exact
 // or subtree matches (mirroring seatbelt's `(allow file-write* (subpath ...))`);
 // glob patterns use doublestar.
 //
@@ -65,7 +67,7 @@ func CheckWritePath(path string, cwd string, cfg *config.Config) error {
 		return &PathBlockedError{Path: clean, Op: PathOpWrite, MatchedRule: rule, Reason: "dangerous path"}
 	}
 
-	if rule, ok := matchPathRule(clean, cfg.Filesystem.DenyWrite); ok {
+	if rule, denied := deniedInAnySpelling(newPathPolicy(cfg.Filesystem.AllowWrite, cfg.Filesystem.DenyWrite), clean); denied {
 		return &PathBlockedError{Path: clean, Op: PathOpWrite, MatchedRule: rule, Reason: "denyWrite"}
 	}
 
@@ -80,7 +82,7 @@ func CheckWritePath(path string, cwd string, cfg *config.Config) error {
 // profile generators. Precedence mirrors wrap mode:
 //
 //  1. denyRead blocks the path in both read modes, unless a literal allowRead
-//     entry strictly inside the denied area reopens it (see readPolicy). The
+//     entry strictly inside the denied area reopens it (see pathPolicy). The
 //     most specific literal entry wins and denyRead wins a tie.
 //  2. Without defaultDenyRead (read-mostly mode), everything else is
 //     readable.
@@ -105,11 +107,8 @@ func CheckReadPath(path string, cwd string, cfg *config.Config) error {
 		return &PathBlockedError{Path: path, Op: PathOpRead, Reason: err.Error()}
 	}
 
-	policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
-	for _, spelling := range []string{clean, resolveExistingPrefix(clean)} {
-		if rule, denied := policy.deniedBy(spelling); denied {
-			return &PathBlockedError{Path: clean, Op: PathOpRead, MatchedRule: rule, Reason: "denyRead"}
-		}
+	if rule, denied := deniedInAnySpelling(newPathPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead), clean); denied {
+		return &PathBlockedError{Path: clean, Op: PathOpRead, MatchedRule: rule, Reason: "denyRead"}
 	}
 
 	// strictDenyRead implies defaultDenyRead; handle configs that were not
@@ -138,6 +137,17 @@ func CheckReadPath(path string, cwd string, cfg *config.Config) error {
 	}
 
 	return &PathBlockedError{Path: clean, Op: PathOpRead, Reason: "not in allowRead"}
+}
+
+// deniedInAnySpelling asks policy about clean as given and about its
+// symlink-resolved form, because the sandbox enforces on resolved paths.
+func deniedInAnySpelling(policy *pathPolicy, clean string) (string, bool) {
+	for _, spelling := range []string{clean, resolveExistingPrefix(clean)} {
+		if rule, denied := policy.deniedBy(spelling); denied {
+			return rule, true
+		}
+	}
+	return "", false
 }
 
 // absoluteCleanPath resolves path against cwd when relative. "../" escapes

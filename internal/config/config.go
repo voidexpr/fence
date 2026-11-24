@@ -104,8 +104,8 @@ type FilesystemConfig struct {
 	AllowRead       []string `json:"allowRead" description:"Additional filesystem paths the sandbox may read. Accepts absolute paths and glob patterns. A literal path (no glob) strictly inside a denyRead entry stays readable."`
 	AllowExecute    []string `json:"allowExecute" description:"Paths the sandbox may execute (grants read and execute permission, but not directory listing). Use for binaries that must be reachable but whose parent directories should not be browsable."`
 	DenyRead        []string `json:"denyRead" description:"Paths blocked from reading, even if they would otherwise be permitted by allowRead or system defaults. A literal allowRead path strictly inside an entry reopens that path; a denyRead entry equal to or deeper than it still wins."`
-	AllowWrite      []string `json:"allowWrite" description:"Filesystem paths the sandbox may write to. Accepts absolute paths and glob patterns."`
-	DenyWrite       []string `json:"denyWrite" description:"Paths explicitly blocked from writing, even if they would otherwise be permitted by allowWrite."`
+	AllowWrite      []string `json:"allowWrite" description:"Filesystem paths the sandbox may write to. Accepts absolute paths and glob patterns. A literal path (no glob) strictly inside a denyWrite entry stays writable."`
+	DenyWrite       []string `json:"denyWrite" description:"Paths blocked from writing, even if they would otherwise be permitted by allowWrite. A literal allowWrite path strictly inside an entry reopens that path; a denyWrite entry equal to or deeper than it still wins."`
 	AllowGitConfig  bool     `json:"allowGitConfig,omitempty" description:"If true, allow read access to ~/.gitconfig and ~/.config/git. Enable when git operations inside the sandbox need the user's identity or settings."`
 }
 

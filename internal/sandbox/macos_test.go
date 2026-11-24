@@ -128,6 +128,7 @@ func buildMacOSParamsForTest(cfg *config.Config) MacOSSandboxParams {
 		ReadAllowPaths:          cfg.Filesystem.AllowRead,
 		ReadDenyPaths:           cfg.Filesystem.DenyRead,
 		WriteAllowPaths:         allowPaths,
+		WriteCarveOutPaths:      cfg.Filesystem.AllowWrite,
 		WriteDenyPaths:          cfg.Filesystem.DenyWrite,
 		AllowPty:                cfg.AllowPty,
 		AllowGitConfig:          cfg.Filesystem.AllowGitConfig,
@@ -940,7 +941,7 @@ func countRuleBlockOccurrences(rules []string, want ...string) int {
 
 func TestGenerateWriteRules_DeduplicatesSharedAncestorMoveRules(t *testing.T) {
 	logTag := "test-log"
-	rules := generateWriteRules(nil, []string{
+	rules := generateWriteRules(nil, nil, []string{
 		"/fence-issue-74-home/.pypirc",
 		"/fence-issue-74-home/.netrc",
 	}, false, "", logTag)
@@ -984,7 +985,7 @@ func TestGenerateWriteRules_DeduplicatesSharedAncestorMoveRules(t *testing.T) {
 
 func TestGenerateWriteRules_DeduplicatesExactDuplicateRules(t *testing.T) {
 	logTag := "test-log"
-	rules := generateWriteRules(nil, []string{
+	rules := generateWriteRules(nil, nil, []string{
 		"/fence-issue-74-dup/.pypirc",
 		"/fence-issue-74-dup/.pypirc",
 	}, false, "", logTag)
@@ -1040,7 +1041,7 @@ func TestGenerateWriteRules_UsesWorkspaceScopedMandatoryDenyPatterns(t *testing.
 		_ = os.Chdir(originalWD)
 	}()
 
-	rules := generateWriteRules([]string{workspace}, nil, false, workspace, "test-log")
+	rules := generateWriteRules([]string{workspace}, nil, nil, false, workspace, "test-log")
 	joinedRules := strings.Join(rules, "\n")
 
 	scopedRegex := GlobToRegex(filepath.Join(ResolveSandboxWorkingDir(workspace), "**", ".idea", "**"))
@@ -1218,10 +1219,16 @@ func TestWrapCommandMacOS_ExposedHostPathsSkipsMissing(t *testing.T) {
 	}
 }
 
-// seatbeltReadVerdict evaluates generated read rules the way Seatbelt does:
-// the last rule matching the operation and path decides. It understands the
-// filters generateReadRules emits.
+// seatbeltReadVerdict evaluates generated read rules for a read operation.
 func seatbeltReadVerdict(t *testing.T, rules []string, op, path string) bool {
+	t.Helper()
+	return seatbeltVerdict(t, rules, op, "file-read*", path)
+}
+
+// seatbeltVerdict evaluates generated rules the way Seatbelt does: the last
+// rule matching the operation (by name or through wildcard) and the path
+// decides. It understands the filters the rule generators emit.
+func seatbeltVerdict(t *testing.T, rules []string, op, wildcard, path string) bool {
 	t.Helper()
 	filterRe := regexp.MustCompile(`\((subpath|literal) ("(?:[^"\\]|\\.)*")\)|\(regex #"((?:[^"\\]|\\.)*)"\)`)
 	headRe := regexp.MustCompile(`^\((allow|deny) ([a-z*-]+)`)
@@ -1241,7 +1248,7 @@ func seatbeltReadVerdict(t *testing.T, rules []string, op, path string) bool {
 		if head == nil {
 			t.Fatalf("unparsed rule: %s", rule)
 		}
-		if head[2] != op && head[2] != "file-read*" {
+		if head[2] != op && head[2] != wildcard {
 			continue
 		}
 		matches := true
@@ -1272,9 +1279,9 @@ func mustUnquote(t *testing.T, quoted string) string {
 }
 
 func TestGenerateReadRules_CarveOuts(t *testing.T) {
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 
-	for _, tc := range readCarveOutCases {
+	for _, tc := range carveOutCases {
 		for _, defaultDenyRead := range []bool{false, true} {
 			name := tc.name + "/read-mostly"
 			if defaultDenyRead {
@@ -1283,7 +1290,7 @@ func TestGenerateReadRules_CarveOuts(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				fs := tc.filesystemConfig(root, defaultDenyRead)
 				rules := generateReadRules(defaultDenyRead, false, fs.AllowRead, fs.DenyRead, "tag")
-				for _, path := range joinAll(root, tc.readable) {
+				for _, path := range joinAll(root, tc.open) {
 					if !seatbeltReadVerdict(t, rules, "file-read-data", path) {
 						t.Errorf("expected profile to allow reading %s\n%s", path, strings.Join(rules, "\n"))
 					}
@@ -1299,7 +1306,7 @@ func TestGenerateReadRules_CarveOuts(t *testing.T) {
 }
 
 func TestGenerateReadRules_CarveOutRuleOrder(t *testing.T) {
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 	in := func(name string) string { return filepath.Join(root, name) }
 
 	rules := generateReadRules(false, false,
@@ -1342,7 +1349,7 @@ func TestGenerateReadRules_CarveOutRuleOrder(t *testing.T) {
 }
 
 func TestGenerateReadCarveOutRules_NoneWithoutCarveOut(t *testing.T) {
-	policy := newReadPolicy([]string{"/opt/tools", "/home/user/.ssh/*"}, []string{"/home/user/.ssh", "**/.env"})
+	policy := newPathPolicy([]string{"/opt/tools", "/home/user/.ssh/*"}, []string{"/home/user/.ssh", "**/.env"})
 	if rules := generateReadCarveOutRules(policy, []string{"file-read*"}, "tag"); rules != nil {
 		t.Fatalf("expected no carve-out rules, got:\n%s", strings.Join(rules, "\n"))
 	}
@@ -1351,7 +1358,7 @@ func TestGenerateReadCarveOutRules_NoneWithoutCarveOut(t *testing.T) {
 // An exposed host path follows the allowRead rules on macOS: it reopens a
 // denied parent, and loses to a deny on the same path.
 func TestWrapCommandMacOS_ExposedHostPathIsACarveOut(t *testing.T) {
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 	exposed := filepath.Join(root, "d", "f")
 	cfg := &config.Config{Filesystem: config.FilesystemConfig{DenyRead: []string{filepath.Join(root, "d")}}}
 
@@ -1361,5 +1368,91 @@ func TestWrapCommandMacOS_ExposedHostPathIsACarveOut(t *testing.T) {
 	}
 	if !strings.Contains(cmd, fmt.Sprintf("(allow file-read*\n  (subpath %s))", escapePath(exposed))) {
 		t.Errorf("expected exposed path to be reopened inside the denied folder, got:\n%s", cmd)
+	}
+}
+
+func TestGenerateWriteRules_CarveOuts(t *testing.T) {
+	root := newCarveOutTree(t)
+
+	for _, tc := range carveOutCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := tc.writeConfig(root)
+			rules := generateWriteRules(fs.AllowWrite, fs.AllowWrite, fs.DenyWrite, false, root, "tag")
+			for _, path := range joinAll(root, tc.open) {
+				for _, op := range []string{"file-write-data", "file-write-unlink"} {
+					if !seatbeltVerdict(t, rules, op, "file-write*", path) {
+						t.Errorf("expected profile to allow %s on %s\n%s", op, path, strings.Join(rules, "\n"))
+					}
+				}
+			}
+			for _, path := range joinAll(root, tc.blocked) {
+				for _, op := range []string{"file-write-data", "file-write-unlink"} {
+					if seatbeltVerdict(t, rules, op, "file-write*", path) {
+						t.Errorf("expected profile to deny %s on %s\n%s", op, path, strings.Join(rules, "\n"))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGenerateWriteRules_CarveOutKeepsMandatoryProtection(t *testing.T) {
+	root := newCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	rules := generateWriteRules([]string{root, in("d/sub")}, []string{root, in("d/sub")}, []string{in("d")}, false, root, "tag")
+
+	if !seatbeltVerdict(t, rules, "file-write-data", "file-write*", in("d/sub/x")) {
+		t.Fatalf("expected the carve-out to be writable:\n%s", strings.Join(rules, "\n"))
+	}
+	for _, path := range []string{in("d/sub/.bashrc"), in("d/sub/.git/hooks/pre-commit")} {
+		if seatbeltVerdict(t, rules, "file-write-data", "file-write*", path) {
+			t.Errorf("expected dangerous path %s to stay blocked:\n%s", path, strings.Join(rules, "\n"))
+		}
+	}
+	// The denied folder itself must not be renamed away.
+	if seatbeltVerdict(t, rules, "file-write-unlink", "file-write*", in("d")) {
+		t.Errorf("expected the denied folder to stay unmovable:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+func TestGenerateWriteRules_DefaultWritePathIsNotACarveOut(t *testing.T) {
+	rules := generateWriteRules([]string{"/opt/state/cache"}, nil, []string{"/opt/state"}, false, "/workspace", "tag")
+	if seatbeltVerdict(t, rules, "file-write-data", "file-write*", "/opt/state/cache/x") {
+		t.Fatalf("an allow path outside the carve-out list must not reopen a deny:\n%s", strings.Join(rules, "\n"))
+	}
+}
+
+// A denyRead entry given by a symlink also closes the link itself, so
+// readlink does not show where the denied folder really is. A carve-out below
+// it must be reachable through the link, which needs the link stat-able. On
+// macOS that is the permission readlink uses, so the target shows again.
+func TestGenerateReadRules_DenyGivenByLinkClosesTheLink(t *testing.T) {
+	root := newCarveOutTree(t)
+	target := filepath.Join(root, "d")
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	rules := generateReadRules(false, false, nil, []string{link}, "tag")
+	for _, op := range []string{"file-read-data", "file-read-metadata"} {
+		if seatbeltReadVerdict(t, rules, op, link) {
+			t.Errorf("expected %s on the link to be denied:\n%s", op, strings.Join(rules, "\n"))
+		}
+	}
+	if seatbeltReadVerdict(t, rules, "file-read-data", filepath.Join(target, "f")) {
+		t.Errorf("expected the target to be denied:\n%s", strings.Join(rules, "\n"))
+	}
+
+	rules = generateReadRules(false, false, []string{filepath.Join(link, "f")}, []string{link}, "tag")
+	if seatbeltReadVerdict(t, rules, "file-read-data", link) {
+		t.Errorf("expected the link to stay unreadable with a carve-out:\n%s", strings.Join(rules, "\n"))
+	}
+	if !seatbeltReadVerdict(t, rules, "file-read-metadata", link) {
+		t.Errorf("expected the link to be stat-able with a carve-out:\n%s", strings.Join(rules, "\n"))
+	}
+	if !seatbeltReadVerdict(t, rules, "file-read-data", filepath.Join(target, "f")) {
+		t.Errorf("expected the carve-out to be readable:\n%s", strings.Join(rules, "\n"))
 	}
 }

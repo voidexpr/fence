@@ -1338,6 +1338,11 @@ func linuxLateMountsExpose(t *testing.T, args []string, path string) bool {
 				visible = args[i+1] == args[i+2]
 			}
 			i += 3
+		case "--bind":
+			if pathContains(args[i+2], path) {
+				visible = true
+			}
+			i += 3
 		default:
 			t.Fatalf("unexpected late mount argument %q in %q", args[i], args)
 		}
@@ -1348,9 +1353,9 @@ func linuxLateMountsExpose(t *testing.T, args []string, path string) bool {
 func TestAppendLinuxLatePolicyMounts_CarveOuts(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 
-	for _, tc := range readCarveOutCases {
+	for _, tc := range carveOutCases {
 		for _, defaultDenyRead := range []bool{false, true} {
 			name := tc.name + "/read-mostly"
 			if defaultDenyRead {
@@ -1362,7 +1367,7 @@ func TestAppendLinuxLatePolicyMounts_CarveOuts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
 				}
-				for _, path := range joinAll(root, tc.readable) {
+				for _, path := range joinAll(root, tc.open) {
 					if !linuxLateMountsExpose(t, args, path) {
 						t.Errorf("expected %s to be visible; args=%q", path, args)
 					}
@@ -1379,7 +1384,7 @@ func TestAppendLinuxLatePolicyMounts_CarveOuts(t *testing.T) {
 
 func TestAppendLinuxLatePolicyMounts_CarveOutMountOrder(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 	in := func(name string) string { return filepath.Join(root, name) }
 
 	cfg := &config.Config{Filesystem: config.FilesystemConfig{
@@ -1403,7 +1408,7 @@ func TestAppendLinuxLatePolicyMounts_CarveOutMountOrder(t *testing.T) {
 
 func TestAppendLinuxLatePolicyMounts_CarveOutThroughSymlink(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 	target := filepath.Join(root, "d")
 	link := filepath.Join(root, "link")
 	if err := os.Symlink(target, link); err != nil {
@@ -1433,7 +1438,7 @@ func TestAppendLinuxLatePolicyMounts_CarveOutThroughSymlink(t *testing.T) {
 
 func TestAppendLinuxLatePolicyMounts_MissingCarveOutIsAnError(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := newReadCarveOutTree(t)
+	root := newCarveOutTree(t)
 	in := func(name string) string { return filepath.Join(root, name) }
 
 	cfg := &config.Config{Filesystem: config.FilesystemConfig{
@@ -1450,5 +1455,159 @@ func TestAppendLinuxLatePolicyMounts_MissingCarveOutIsAnError(t *testing.T) {
 	cfg.Filesystem.DenyRead = []string{in("absent")}
 	if _, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false); err != nil {
 		t.Fatalf("expected no error when the denied folder does not exist, got %v", err)
+	}
+}
+
+// linuxLateMountsWritable replays late mount arguments over a writable host
+// tree: the last bind covering path decides whether it stays writable.
+func linuxLateMountsWritable(t *testing.T, args []string, path string) bool {
+	t.Helper()
+	writable := true
+	for i := 0; i < len(args); {
+		switch args[i] {
+		case "--ro-bind", "--bind":
+			if pathContains(args[i+2], path) {
+				writable = args[i] == "--bind"
+			}
+			i += 3
+		default:
+			t.Fatalf("unexpected late mount argument %q in %q", args[i], args)
+		}
+	}
+	return writable
+}
+
+func TestLinuxLateMountPlanner_WritablePuncturesReadOnly(t *testing.T) {
+	planner := newLinuxLateMountPlanner()
+	// Insertion order must not matter.
+	planner.Add("/work/.ateam/open/locked", linuxLateMountReadOnly)
+	planner.Add("/work/.ateam/open", linuxLateMountWritable)
+	planner.Add("/work/.ateam/other", linuxLateMountReadOnly)
+	planner.Add("/work/.ateam", linuxLateMountReadOnly)
+
+	want := []linuxLateMount{
+		{Path: "/work/.ateam", Kind: linuxLateMountReadOnly},
+		{Path: "/work/.ateam/open", Kind: linuxLateMountWritable},
+		{Path: "/work/.ateam/open/locked", Kind: linuxLateMountReadOnly},
+	}
+	if got := planner.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("unexpected plan:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestLinuxLateMountPlanner_ReadOnlyWinsOverWritableOnSamePath(t *testing.T) {
+	planner := newLinuxLateMountPlanner()
+	planner.Add("/work/.ateam", linuxLateMountReadOnly)
+	planner.Add("/work/.ateam/hooks", linuxLateMountWritable)
+	planner.Add("/work/.ateam/hooks", linuxLateMountReadOnly)
+
+	want := []linuxLateMount{{Path: "/work/.ateam", Kind: linuxLateMountReadOnly}}
+	if got := planner.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("unexpected plan:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestLinuxLateMountPlanner_WritableInsideMaskIsDropped(t *testing.T) {
+	planner := newLinuxLateMountPlanner()
+	planner.Add("/work/secret", linuxLateMountMaskDir)
+	planner.Add("/work/secret/open", linuxLateMountWritable)
+
+	want := []linuxLateMount{{Path: "/work/secret", Kind: linuxLateMountMaskDir}}
+	if got := planner.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("unexpected plan:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_WriteCarveOuts(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	root := newCarveOutTree(t)
+
+	for _, tc := range carveOutCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Filesystem: tc.writeConfig(root)}
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, false, nil, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
+			for _, path := range joinAll(root, tc.open) {
+				if !linuxLateMountsWritable(t, args, path) {
+					t.Errorf("expected %s to be writable; args=%q", path, args)
+				}
+			}
+			for _, path := range joinAll(root, tc.blocked) {
+				if linuxLateMountsWritable(t, args, path) {
+					t.Errorf("expected %s to be read-only; args=%q", path, args)
+				}
+			}
+		})
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_WriteCarveOutMountOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{
+		AllowWrite: []string{in("d/sub")},
+		DenyWrite:  []string{in("d/sub/deep"), in("d")},
+	}}
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false)
+	if err != nil {
+		t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+	}
+
+	want := []string{
+		"--ro-bind", in("d"), in("d"),
+		"--bind", in("d/sub"), in("d/sub"),
+		"--ro-bind", in("d/sub/deep"), in("d/sub/deep"),
+	}
+	if !linuxArgsContain(args, want) {
+		t.Fatalf("expected read-only, writable, nested read-only in that order, got %q", args)
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_WriteCarveOutKeepsMandatoryProtection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+	bashrc := in("d/sub/.bashrc")
+	if err := os.WriteFile(bashrc, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create dangerous file: %v", err)
+	}
+
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{
+		AllowWrite: []string{in("d/sub"), bashrc},
+		DenyWrite:  []string{in("d")},
+	}}
+	// The workspace is the tree root, so the dangerous file is discovered.
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, root, false, nil, false)
+	if err != nil {
+		t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+	}
+	if !linuxLateMountsWritable(t, args, in("d/sub/x")) {
+		t.Errorf("expected the carve-out to be writable; args=%q", args)
+	}
+	if linuxLateMountsWritable(t, args, bashrc) {
+		t.Errorf("expected the dangerous file to stay read-only; args=%q", args)
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_MissingWriteCarveOutStaysReadOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{
+		AllowWrite: []string{in("d/missing")},
+		DenyWrite:  []string{in("d")},
+	}}
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false)
+	if err != nil {
+		t.Fatalf("expected a missing write carve-out to only warn, got %v", err)
+	}
+	if linuxLateMountsWritable(t, args, in("d/missing")) {
+		t.Errorf("expected the missing carve-out to stay read-only; args=%q", args)
 	}
 }
