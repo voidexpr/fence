@@ -101,9 +101,9 @@ type FilesystemConfig struct {
 	DefaultDenyRead bool     `json:"defaultDenyRead,omitempty" description:"If true, deny all filesystem reads by default. Only paths listed in allowRead (and essential system paths) remain readable. Use for strict read isolation."`
 	StrictDenyRead  bool     `json:"strictDenyRead,omitempty" description:"If true, suppress the default readable system paths that are normally added when defaultDenyRead is enabled. Only paths in allowRead will be readable. Implies defaultDenyRead."`
 	WSLInterop      *bool    `json:"wslInterop,omitempty" description:"Controls access to the WSL interop binary on Windows Subsystem for Linux. If omitted, auto-detected: WSL environments allow /init, non-WSL environments do not."`
-	AllowRead       []string `json:"allowRead" description:"Additional filesystem paths the sandbox may read. Accepts absolute paths and glob patterns."`
+	AllowRead       []string `json:"allowRead" description:"Additional filesystem paths the sandbox may read. Accepts absolute paths and glob patterns. A literal path (no glob) strictly inside a denyRead entry stays readable."`
 	AllowExecute    []string `json:"allowExecute" description:"Paths the sandbox may execute (grants read and execute permission, but not directory listing). Use for binaries that must be reachable but whose parent directories should not be browsable."`
-	DenyRead        []string `json:"denyRead" description:"Paths explicitly blocked from reading, even if they would otherwise be permitted by allowRead or system defaults."`
+	DenyRead        []string `json:"denyRead" description:"Paths blocked from reading, even if they would otherwise be permitted by allowRead or system defaults. A literal allowRead path strictly inside an entry reopens that path; a denyRead entry equal to or deeper than it still wins."`
 	AllowWrite      []string `json:"allowWrite" description:"Filesystem paths the sandbox may write to. Accepts absolute paths and glob patterns."`
 	DenyWrite       []string `json:"denyWrite" description:"Paths explicitly blocked from writing, even if they would otherwise be permitted by allowWrite."`
 	AllowGitConfig  bool     `json:"allowGitConfig,omitempty" description:"If true, allow read access to ~/.gitconfig and ~/.config/git. Enable when git operations inside the sandbox need the user's identity or settings."`

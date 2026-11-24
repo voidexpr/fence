@@ -34,12 +34,25 @@ func RemoveTrailingGlobSuffix(pattern string) string {
 // NormalizePath normalizes a path for sandbox configuration.
 // Handles tilde expansion and relative paths.
 func NormalizePath(pathPattern string) string {
+	normalized := expandPathPattern(pathPattern)
+
+	// For non-glob patterns, try to resolve symlinks
+	if !ContainsGlobChars(normalized) {
+		if resolved, err := filepath.EvalSymlinks(normalized); err == nil {
+			return resolved
+		}
+	}
+
+	return normalized
+}
+
+// expandPathPattern expands ~ and relative paths without resolving symlinks.
+func expandPathPattern(pathPattern string) string {
 	home, _ := os.UserHomeDir()
 	cwd, _ := os.Getwd()
 
 	normalized := pathPattern
 
-	// Expand ~ and relative paths
 	switch {
 	case pathPattern == "~":
 		normalized = home
@@ -49,13 +62,6 @@ func NormalizePath(pathPattern string) string {
 		normalized, _ = filepath.Abs(filepath.Join(cwd, pathPattern))
 	case !filepath.IsAbs(pathPattern) && !ContainsGlobChars(pathPattern):
 		normalized, _ = filepath.Abs(filepath.Join(cwd, pathPattern))
-	}
-
-	// For non-glob patterns, try to resolve symlinks
-	if !ContainsGlobChars(normalized) {
-		if resolved, err := filepath.EvalSymlinks(normalized); err == nil {
-			return resolved
-		}
 	}
 
 	return normalized

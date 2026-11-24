@@ -169,6 +169,13 @@ type Config struct {
   - `allowRead` for readable/listable paths
   - `allowWrite` for writable paths (which also implies read/execute)
 - `denyRead` masks files or directories even if broader allow rules exist.
+  A literal `allowRead` path strictly inside a `denyRead` entry is a carve-out
+  and stays readable: the most specific literal path wins, and deny wins a tie.
+  `readPolicy` (`internal/sandbox/read_policy.go`) holds this precedence. The
+  macOS profile generator, the Linux mount planner and `CheckReadPath` all use
+  it. macOS emits the reopening allow rules after the deny rules, ordered by
+  path depth. Linux adds a "reveal" mount (a read-only bind of the path onto
+  itself) after the `--tmpfs` mask that covers it.
 - `denyWrite` turns specific paths back into read-only.
 - Fence also applies mandatory dangerous-path protection independent of user
   config. This protects high-risk targets such as shell startup files, nested

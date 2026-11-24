@@ -174,8 +174,10 @@ type PathBlockedError = sandbox.PathBlockedError
 // the sandbox profile generators consume (denyRead, defaultDenyRead,
 // strictDenyRead, allowRead, allowExecute, allowWrite-implies-read, and the
 // default readable system paths), but it does not sandbox anything and the
-// kernel-level sandbox remains authoritative. It evaluates the declared
-// path lexically and does not resolve symlinks on the target.
+// kernel-level sandbox remains authoritative. A literal allowRead path
+// strictly inside a denyRead entry reopens it; denyRead wins a tie. The
+// denyRead step is checked on the declared path and on its symlink-resolved
+// form; the allow steps evaluate the declared path lexically.
 //
 // Relative paths resolve against cwd; pass "" to require absolute paths.
 func CheckReadPath(cfg *Config, path, cwd string) error {

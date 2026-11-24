@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -168,6 +169,8 @@ Configuration file format:
 		"How the sandboxed service binds its exposed ports: 'in-sandbox' (default; fence sets up a reverse bridge) or 'on-host' (an external daemon like docker/podman binds the port outside the sandbox netns; no reverse bridge)")
 	rootCmd.Flags().StringArrayVar(&exposeHostPaths, "expose-host-path", nil, "Expose a host file/directory at the same path inside the sandbox (read-only). Can be used multiple times.")
 	rootCmd.Flags().StringArrayVar(&exposeHostPathsRW, "expose-host-path-rw", nil, "Expose a host file/directory at the same path inside the sandbox (read-write). Can be used multiple times.")
+	rootCmd.Flags().StringArray("allow-read", nil, "Add a path to filesystem.allowRead. A literal path inside a denied directory stays readable. Can be used multiple times.")
+	rootCmd.Flags().StringArray("deny-read", nil, "Add a path to filesystem.denyRead. Can be used multiple times.")
 	rootCmd.Flags().StringVar(&shellMode, "shell", sandbox.ShellModeDefault, "Shell mode for command execution: default (bash) or user ($SHELL)")
 	rootCmd.Flags().BoolVar(&shellLogin, "shell-login", false, "Run shell as login shell (-lc). Use with --shell user for shell init compatibility")
 	rootCmd.Flags().StringVar(&fenceLogFile, "fence-log-file", "", "Write Fence monitor/debug logs to this file while keeping command output on its normal streams")
@@ -602,7 +605,24 @@ func applyCLIConfigOverrides(cmd *cobra.Command, cfg *config.Config, forceNewSes
 		value := forceNewSessionValue
 		cfg.ForceNewSession = &value
 	}
+	cfg.Filesystem.AllowRead = appendCLIPaths(cmd, "allow-read", cfg.Filesystem.AllowRead)
+	cfg.Filesystem.DenyRead = appendCLIPaths(cmd, "deny-read", cfg.Filesystem.DenyRead)
 	return cfg
+}
+
+// appendCLIPaths adds the values of a repeatable path flag to a config list,
+// so the flag has the same semantics as the config key.
+func appendCLIPaths(cmd *cobra.Command, flag string, paths []string) []string {
+	values, err := cmd.Flags().GetStringArray(flag)
+	if err != nil {
+		return paths
+	}
+	for _, value := range values {
+		if value != "" && !slices.Contains(paths, value) {
+			paths = append(paths, value)
+		}
+	}
+	return paths
 }
 
 func startCommand(execCmd *exec.Cmd, usePTY bool) (func(), error) {

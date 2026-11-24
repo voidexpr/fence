@@ -204,8 +204,8 @@ func linuxReadableHostSubmountRootsFromMountInfo(mountInfo string) []string {
 	}
 
 	slices.SortFunc(roots, func(a, b string) int {
-		depthA := linuxLateMountDepth(a)
-		depthB := linuxLateMountDepth(b)
+		depthA := pathDepth(a)
+		depthB := pathDepth(b)
 		if depthA != depthB {
 			return depthA - depthB
 		}
@@ -230,7 +230,7 @@ func linuxShouldPreserveHostSubmount(entry linuxMountInfoEntry) bool {
 	}
 
 	for _, controlled := range []string{"/dev", "/proc", "/sys", "/run", "/tmp"} {
-		if linuxPathContains(controlled, mountPoint) {
+		if pathContains(controlled, mountPoint) {
 			return false
 		}
 	}
@@ -257,10 +257,10 @@ func linuxContainingPreservedSubmountRoot(path string, preserved map[string]bool
 	path = filepath.Clean(path)
 	var best string
 	for root := range preserved {
-		if !linuxPathContains(root, path) {
+		if !pathContains(root, path) {
 			continue
 		}
-		if best == "" || linuxLateMountDepth(root) > linuxLateMountDepth(best) {
+		if best == "" || pathDepth(root) > pathDepth(best) {
 			best = root
 		}
 	}
@@ -700,8 +700,8 @@ func resolveLinuxCrossMountCandidates(paths []string, writablePaths map[string]b
 	}
 
 	slices.SortFunc(candidates, func(a, b linuxCrossMountCandidate) int {
-		depthA := linuxLateMountDepth(a.Path)
-		depthB := linuxLateMountDepth(b.Path)
+		depthA := pathDepth(a.Path)
+		depthB := pathDepth(b.Path)
 		if depthA != depthB {
 			return depthA - depthB
 		}
@@ -715,7 +715,7 @@ func resolveLinuxCrossMountCandidates(paths []string, writablePaths map[string]b
 			continue
 		}
 		for _, root := range writableRoots {
-			if linuxPathContains(root, candidates[i].Path) {
+			if pathContains(root, candidates[i].Path) {
 				candidates[i].Writable = true
 				break
 			}
@@ -1376,7 +1376,10 @@ func WrapCommandLinuxWithOptions(cfg *config.Config, command string, bridge *Lin
 		}
 	}
 
-	bwrapArgs = appendLinuxLatePolicyMounts(bwrapArgs, cfg, cwd, defaultDenyRead, deniedExecPaths, opts.Debug)
+	bwrapArgs, err = appendLinuxLatePolicyMounts(bwrapArgs, cfg, cwd, defaultDenyRead, deniedExecPaths, opts.Debug)
+	if err != nil {
+		return "", err
+	}
 
 	// Apply caller-registered host path exposures. These run AFTER all tmpfs
 	// overmounts above (in particular --tmpfs /tmp), so a path the caller

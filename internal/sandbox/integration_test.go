@@ -580,3 +580,118 @@ func TestExecuteShellCommandBwrapError(t *testing.T) {
 		t.Errorf("expected command to fail with an error")
 	}
 }
+
+// TestIntegration_ReadCarveOut launches a real sandbox to check that a
+// literal allowRead path inside a denyRead folder stays readable, and that
+// nothing else in the folder does.
+func TestIntegration_ReadCarveOut(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	for _, defaultDenyRead := range []bool{false, true} {
+		name := "read-mostly"
+		if defaultDenyRead {
+			name = "defaultDenyRead"
+		}
+		t.Run(name, func(t *testing.T) {
+			workspace := createTempWorkspace(t)
+			secretDir := filepath.Join(workspace, "secret")
+			carved := createTestFile(t, secretDir, "config", "carved content")
+			sibling := createTestFile(t, secretDir, "id_key", "sibling content")
+			nested := createTestFile(t, secretDir, "pub/nested/key", "nested content")
+			closedAgain := createTestFile(t, secretDir, "pub/private/key", "closed content")
+
+			cfg := testConfigWithWorkspace(workspace)
+			cfg.Filesystem.DefaultDenyRead = defaultDenyRead
+			cfg.Filesystem.DenyRead = []string{secretDir, filepath.Join(secretDir, "pub", "private")}
+			cfg.Filesystem.AllowRead = []string{carved, filepath.Join(secretDir, "pub")}
+			if defaultDenyRead {
+				// allowWrite does not grant reads on macOS in this mode.
+				cfg.Filesystem.AllowRead = append(cfg.Filesystem.AllowRead, workspace)
+			}
+
+			result := runUnderSandbox(t, cfg, "cat "+carved, workspace)
+			assertAllowed(t, result)
+			assertContains(t, result.Stdout, "carved content")
+
+			result = runUnderSandbox(t, cfg, "cat "+nested, workspace)
+			assertAllowed(t, result)
+			assertContains(t, result.Stdout, "nested content")
+
+			assertBlocked(t, runUnderSandbox(t, cfg, "cat "+sibling, workspace))
+			assertBlocked(t, runUnderSandbox(t, cfg, "cat "+closedAgain, workspace))
+
+			// The closed parent can be stat-ed but its other entries stay hidden.
+			assertAllowed(t, runUnderSandbox(t, cfg, "test -d "+secretDir, workspace))
+			result = runUnderSandbox(t, cfg, "ls "+secretDir, workspace)
+			if strings.Contains(result.Stdout, "id_key") {
+				t.Errorf("sibling name leaked through the closed parent: %q", result.Stdout)
+			}
+
+			// Renaming the denied folder away must stay refused.
+			assertBlocked(t, runUnderSandbox(t, cfg, "mv "+secretDir+" "+filepath.Join(workspace, "moved"), workspace))
+			assertFileExists(t, carved)
+		})
+	}
+}
+
+// TestIntegration_ReadCarveOutIsNotWritable uses a folder outside every
+// writable path: reopening a path for reads must not make it writable.
+func TestIntegration_ReadCarveOutIsNotWritable(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	secretDir, err := os.MkdirTemp(cwd, "fence-carve-out-*")
+	if err != nil {
+		t.Fatalf("failed to create fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(secretDir) })
+	carved := createTestFile(t, secretDir, "config", "carved content")
+
+	workspace := createTempWorkspace(t)
+	cfg := testConfigWithWorkspace(workspace)
+	cfg.Filesystem.DenyRead = []string{secretDir}
+	cfg.Filesystem.AllowRead = []string{carved}
+
+	result := runUnderSandbox(t, cfg, "cat "+carved, workspace)
+	assertAllowed(t, result)
+	assertContains(t, result.Stdout, "carved content")
+
+	assertBlocked(t, runUnderSandbox(t, cfg, "echo changed > "+carved, workspace))
+	content, err := os.ReadFile(carved) //nolint:gosec
+	if err != nil || string(content) != "carved content" {
+		t.Errorf("carved file changed on the host: %q, %v", content, err)
+	}
+}
+
+// TestIntegration_ReadCarveOutThroughSymlink covers a denied folder that is a
+// link into another folder, with each entry given by either name.
+func TestIntegration_ReadCarveOutThroughSymlink(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	workspace := createTempWorkspace(t)
+	target := filepath.Join(workspace, "Sync", "ssh")
+	link := filepath.Join(workspace, "ssh")
+	createTestFile(t, target, "config", "carved content")
+	createTestFile(t, target, "id_key", "sibling content")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	for _, deny := range []string{link, target} {
+		for _, allowDir := range []string{link, target} {
+			cfg := testConfigWithWorkspace(workspace)
+			cfg.Filesystem.DenyRead = []string{deny}
+			cfg.Filesystem.AllowRead = []string{filepath.Join(allowDir, "config")}
+
+			for _, dir := range []string{link, target} {
+				result := runUnderSandbox(t, cfg, "cat "+filepath.Join(dir, "config"), workspace)
+				assertAllowed(t, result)
+				assertContains(t, result.Stdout, "carved content")
+				assertBlocked(t, runUnderSandbox(t, cfg, "cat "+filepath.Join(dir, "id_key"), workspace))
+			}
+		}
+	}
+}

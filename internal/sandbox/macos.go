@@ -277,39 +277,135 @@ func generateReadRules(defaultDenyRead, strictDenyRead bool, allowPaths, denyPat
 		builder.addRule("(allow file-read*)")
 	}
 
-	// In both modes, deny specific paths (denyRead takes precedence).
+	// In both modes, deny specific paths. denyRead takes precedence except
+	// over the carve-outs emitted at the end.
 	// IMPORTANT: On macOS Seatbelt, a specific operation allow (like file-read-data)
 	// is NOT overridden by a wildcard deny (like file-read*). We must explicitly
 	// deny the same specific operations that were allowed.
-	for _, pathPattern := range denyPaths {
-		ops := []string{"file-read*"}
-		if defaultDenyRead {
-			// In defaultDenyRead mode, we explicitly allowed these two classes.
-			ops = append(ops, "file-read-data", "file-read-metadata")
-		}
+	ops := []string{"file-read*"}
+	if defaultDenyRead {
+		// In defaultDenyRead mode, we explicitly allowed these two classes.
+		ops = append(ops, "file-read-data", "file-read-metadata")
+	}
 
+	for _, pathPattern := range denyPaths {
 		// Emit both /tmp and /private/tmp spellings: a deny emitted for only the
 		// /tmp spelling never fires against the kernel-resolved /private/tmp
 		// path, silently allowing reads the user denied.
-		for _, normalized := range seatbeltPathSpellings(pathPattern) {
-			for _, op := range ops {
-				if ContainsGlobChars(normalized) {
-					regex := GlobToRegex(normalized)
-					builder.addRule(buildFileSystemRegexRule("deny "+op, regex, logTag))
-				} else {
-					builder.addRule(
-						fmt.Sprintf("(deny %s", op),
-						fmt.Sprintf("  (subpath %s)", escapePath(normalized)),
-						fmt.Sprintf("  (with message %q))", logTag),
-					)
-				}
-			}
+		for _, normalized := range seatbeltReadSpellings(pathPattern) {
+			addSeatbeltReadDenyRules(builder, normalized, ops, logTag)
 		}
 	}
 
 	// Block file movement to prevent bypass
 	generateMoveBlockingRules(builder, denyPaths, logTag)
 
+	return append(builder.rules, generateReadCarveOutRules(newReadPolicy(allowPaths, denyPaths), ops, logTag)...)
+}
+
+// seatbeltReadSpellings is seatbeltPathSpellings plus, for a literal path that
+// does not exist yet, the spelling with its existing ancestors resolved. That
+// is the path readPolicy reasons about.
+func seatbeltReadSpellings(pathPattern string) []string {
+	spellings := seatbeltPathSpellings(pathPattern)
+	if rule, glob, ok := newReadRule(pathPattern); ok && !glob {
+		for _, spelling := range expandMacOSPathAliases([]string{rule.resolved}) {
+			if !slices.Contains(spellings, spelling) {
+				spellings = append(spellings, spelling)
+			}
+		}
+	}
+	return spellings
+}
+
+func addSeatbeltReadDenyRules(builder *seatbeltRuleBuilder, normalized string, ops []string, logTag string) {
+	for _, op := range ops {
+		if ContainsGlobChars(normalized) {
+			regex := GlobToRegex(normalized)
+			builder.addRule(buildFileSystemRegexRule("deny "+op, regex, logTag))
+		} else {
+			builder.addRule(
+				fmt.Sprintf("(deny %s", op),
+				fmt.Sprintf("  (subpath %s)", escapePath(normalized)),
+				fmt.Sprintf("  (with message %q))", logTag),
+			)
+		}
+	}
+}
+
+// generateReadCarveOutRules emits the rules that reopen literal allowRead
+// paths inside denied areas. Seatbelt applies the last matching rule, so this
+// section comes after every plain deny and is ordered by path depth: a
+// carve-out overrides the shallower deny it sits in, and a deny nested inside
+// a carve-out is emitted again after it. The operations are the ones the deny
+// rules use, because a deny on a specific operation is only overridden by an
+// allow on that same operation.
+func generateReadCarveOutRules(policy *readPolicy, ops []string, logTag string) []string {
+	carveOuts := policy.carveOuts()
+	if len(carveOuts) == 0 {
+		return nil
+	}
+
+	type step struct {
+		path  string
+		carve *readCarveOut
+	}
+	var steps []step
+	for i := range carveOuts {
+		steps = append(steps, step{path: carveOuts[i].path, carve: &carveOuts[i]})
+	}
+	for _, deny := range policy.literalDenies {
+		if slices.ContainsFunc(carveOuts, func(c readCarveOut) bool { return pathContains(c.path, deny.resolved) }) {
+			steps = append(steps, step{path: deny.resolved})
+		}
+	}
+	// Stable sort keeps a carve-out ahead of a deny of equal depth.
+	slices.SortStableFunc(steps, func(a, b step) int {
+		return pathDepth(a.path) - pathDepth(b.path)
+	})
+
+	// A fresh builder: a nested deny must be repeated here even though the
+	// same rule text already appears earlier in the profile.
+	builder := newSeatbeltRuleBuilder()
+	for _, s := range steps {
+		spellings := expandMacOSPathAliases([]string{s.path})
+		if s.carve == nil {
+			for _, spelling := range spellings {
+				addSeatbeltReadDenyRules(builder, spelling, ops, logTag)
+			}
+			continue
+		}
+
+		for _, spelling := range spellings {
+			for _, op := range ops {
+				builder.addRule(
+					fmt.Sprintf("(allow %s", op),
+					fmt.Sprintf("  (subpath %s))", escapePath(spelling)),
+				)
+			}
+		}
+		// The closed ancestors stay unlistable, but tools stat each path
+		// component on the way to the reopened path.
+		for _, ancestor := range expandMacOSPathAliases(s.carve.closedAncestors) {
+			builder.addRule(
+				"(allow file-read-metadata",
+				fmt.Sprintf("  (literal %s))", escapePath(ancestor)),
+			)
+		}
+		// Glob denies the carve-out does not reopen keep applying inside it.
+		for _, spelling := range spellings {
+			for _, glob := range expandMacOSPathAliases(s.carve.residualGlobs) {
+				regex := strings.ReplaceAll(GlobToRegex(glob), `"`, `\"`)
+				for _, op := range ops {
+					builder.addRule(
+						fmt.Sprintf("(deny %s", op),
+						fmt.Sprintf("  (require-all (subpath %s) (regex #\"%s\"))", escapePath(spelling), regex),
+						fmt.Sprintf("  (with message %q))", logTag),
+					)
+				}
+			}
+		}
+	}
 	return builder.rules
 }
 

@@ -966,7 +966,10 @@ func TestAppendLinuxLatePolicyMounts_DefaultDenyReadDangerousFileVisibility(t *t
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &config.Config{Filesystem: tt.filesystem}
-			args := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
 			hasMask := linuxArgsContain(args, []string{"--ro-bind", "/dev/null", zshrc})
 			hasReadOnly := linuxArgsContain(args, []string{"--ro-bind", zshrc, zshrc})
 
@@ -1004,7 +1007,10 @@ func TestAppendLinuxLatePolicyMounts_DefaultDenyReadDangerousSymlinkAlias(t *tes
 			AllowRead:       []string{"~/.zshrc"},
 		},
 	}
-	args := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+	if err != nil {
+		t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+	}
 
 	if !linuxArgsContain(args, []string{"--ro-bind", target, link}) {
 		t.Fatalf("expected read-only alias bind from %q to %q; args=%q", target, link, args)
@@ -1041,7 +1047,10 @@ func TestAppendLinuxLatePolicyMounts_DefaultDenyReadSymlinkedHomeAncestor(t *tes
 			AllowRead:       []string{"~/.zshrc"},
 		},
 	}
-	args := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, nil, false)
+	if err != nil {
+		t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+	}
 
 	if !linuxArgsContain(args, []string{"--ro-bind", target, lexicalPath}) {
 		t.Fatalf("expected read-only alias bind from %q to %q; args=%q", target, lexicalPath, args)
@@ -1087,7 +1096,10 @@ func TestAppendLinuxLatePolicyMounts_DoesNotAliasDangerousDirectoryUnderSymlinke
 					DenyRead:        tt.denyRead,
 				},
 			}
-			args := appendLinuxLatePolicyMounts(nil, cfg, workspaceLink, true, tt.deniedExecPaths, false)
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, workspaceLink, true, tt.deniedExecPaths, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
 
 			if linuxArgsContain(args, []string{"--ro-bind", dangerousDir, lexicalDangerousDir}) {
 				t.Fatalf("did not expect dangerous directory alias with masked descendants; args=%q", args)
@@ -1141,7 +1153,10 @@ func TestAppendLinuxLatePolicyMounts_DoesNotAliasRestrictedSources(t *testing.T)
 					AllowRead:       []string{"~/.zshrc"},
 				},
 			}
-			args := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, tt.deniedExecPaths, false)
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, true, tt.deniedExecPaths, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
 			if linuxArgsContain(args, []string{"--ro-bind", resolved, link}) {
 				t.Fatalf("did not expect restricted source %q to be aliased; args=%q", resolved, args)
 			}
@@ -1270,5 +1285,170 @@ func TestWrapCommandLinuxWithOptions_DenyReadFileWinsOverSamePathDenyWrite(t *te
 	}
 	if strings.Contains(cmd, rebindFragment) {
 		t.Fatalf("did not expect denyWrite to rebind a masked file: %s", cmd)
+	}
+}
+
+func TestLinuxLateMountPlanner_RevealPuncturesMask(t *testing.T) {
+	planner := newLinuxLateMountPlanner()
+	// Insertion order must not matter.
+	planner.Add("/home/u/.ssh/keys/private", linuxLateMountMaskDir)
+	planner.Add("/home/u/.ssh/keys", linuxLateMountReveal)
+	planner.Add("/home/u/.ssh/hidden/child", linuxLateMountMaskFile)
+	planner.Add("/home/u/.ssh/hidden/ro", linuxLateMountReadOnly)
+	planner.Add("/home/u/.ssh", linuxLateMountMaskDir)
+	planner.Add("/home/u/.ssh/keys/public.pem", linuxLateMountReadOnly)
+
+	want := []linuxLateMount{
+		{Path: "/home/u/.ssh", Kind: linuxLateMountMaskDir},
+		{Path: "/home/u/.ssh/keys", Kind: linuxLateMountReveal},
+		{Path: "/home/u/.ssh/keys/private", Kind: linuxLateMountMaskDir},
+		{Path: "/home/u/.ssh/keys/public.pem", Kind: linuxLateMountReadOnly},
+	}
+	if got := planner.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("unexpected plan:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestLinuxLateMountPlanner_MaskWinsOverRevealOnSamePath(t *testing.T) {
+	planner := newLinuxLateMountPlanner()
+	planner.Add("/home/u/.ssh", linuxLateMountMaskDir)
+	planner.Add("/home/u/.ssh/config", linuxLateMountReveal)
+	planner.Add("/home/u/.ssh/config", linuxLateMountMaskFile)
+
+	want := []linuxLateMount{{Path: "/home/u/.ssh", Kind: linuxLateMountMaskDir}}
+	if got := planner.Mounts(); !slices.Equal(got, want) {
+		t.Fatalf("unexpected plan:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+// linuxLateMountsExpose replays late mount arguments over a fully visible
+// host: the last mount covering path decides whether the host file shows.
+func linuxLateMountsExpose(t *testing.T, args []string, path string) bool {
+	t.Helper()
+	visible := true
+	for i := 0; i < len(args); {
+		switch args[i] {
+		case "--tmpfs":
+			if pathContains(args[i+1], path) {
+				visible = false
+			}
+			i += 2
+		case "--ro-bind":
+			if pathContains(args[i+2], path) {
+				visible = args[i+1] == args[i+2]
+			}
+			i += 3
+		default:
+			t.Fatalf("unexpected late mount argument %q in %q", args[i], args)
+		}
+	}
+	return visible
+}
+
+func TestAppendLinuxLatePolicyMounts_CarveOuts(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	root := newReadCarveOutTree(t)
+
+	for _, tc := range readCarveOutCases {
+		for _, defaultDenyRead := range []bool{false, true} {
+			name := tc.name + "/read-mostly"
+			if defaultDenyRead {
+				name = tc.name + "/defaultDenyRead"
+			}
+			t.Run(name, func(t *testing.T) {
+				cfg := &config.Config{Filesystem: tc.filesystemConfig(root, defaultDenyRead)}
+				args, err := appendLinuxLatePolicyMounts(nil, cfg, cwd, defaultDenyRead, nil, false)
+				if err != nil {
+					t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+				}
+				for _, path := range joinAll(root, tc.readable) {
+					if !linuxLateMountsExpose(t, args, path) {
+						t.Errorf("expected %s to be visible; args=%q", path, args)
+					}
+				}
+				for _, path := range joinAll(root, tc.blocked) {
+					if linuxLateMountsExpose(t, args, path) {
+						t.Errorf("expected %s to be hidden; args=%q", path, args)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_CarveOutMountOrder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newReadCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{
+		AllowRead: []string{in("d/sub")},
+		DenyRead:  []string{in("d/sub/deep"), in("d")},
+	}}
+	args, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false)
+	if err != nil {
+		t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+	}
+
+	want := []string{
+		"--tmpfs", in("d"),
+		"--ro-bind", in("d/sub"), in("d/sub"),
+		"--tmpfs", in("d/sub/deep"),
+	}
+	if !linuxArgsContain(args, want) {
+		t.Fatalf("expected mask, reveal, nested mask in that order, got %q", args)
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_CarveOutThroughSymlink(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newReadCarveOutTree(t)
+	target := filepath.Join(root, "d")
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	for _, deny := range []string{link, target} {
+		for _, allowDir := range []string{link, target} {
+			cfg := &config.Config{Filesystem: config.FilesystemConfig{
+				AllowRead: []string{filepath.Join(allowDir, "f")},
+				DenyRead:  []string{deny},
+			}}
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
+			want := []string{
+				"--tmpfs", target,
+				"--ro-bind", filepath.Join(target, "f"), filepath.Join(target, "f"),
+			}
+			if !linuxArgsContain(args, want) {
+				t.Errorf("deny=%s allow=%s: expected the target to be masked and revealed, got %q", deny, allowDir, args)
+			}
+		}
+	}
+}
+
+func TestAppendLinuxLatePolicyMounts_MissingCarveOutIsAnError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newReadCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	cfg := &config.Config{Filesystem: config.FilesystemConfig{
+		AllowRead: []string{in("d/missing")},
+		DenyRead:  []string{in("d")},
+	}}
+	if _, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false); err == nil {
+		t.Fatal("expected a missing carve-out under a masked directory to be an error")
+	}
+
+	// Nothing is masked when the denied folder is missing too, so there is
+	// nothing to re-expose.
+	cfg.Filesystem.AllowRead = []string{in("absent/missing")}
+	cfg.Filesystem.DenyRead = []string{in("absent")}
+	if _, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false); err != nil {
+		t.Fatalf("expected no error when the denied folder does not exist, got %v", err)
 	}
 }

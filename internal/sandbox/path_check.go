@@ -79,13 +79,18 @@ func CheckWritePath(path string, cwd string, cfg *config.Config) error {
 // CheckReadPath is the read-side policy predicate paralleling the wrap-mode
 // profile generators. Precedence mirrors wrap mode:
 //
-//  1. denyRead always wins, in both read modes.
+//  1. denyRead blocks the path in both read modes, unless a literal allowRead
+//     entry strictly inside the denied area reopens it (see readPolicy). The
+//     most specific literal entry wins and denyRead wins a tie.
 //  2. Without defaultDenyRead (read-mostly mode), everything else is
 //     readable.
 //  3. With defaultDenyRead (implied by strictDenyRead), a path is readable
 //     when it matches allowRead, allowExecute, or allowWrite (allowWrite
 //     grants read), or one of the default readable system paths unless
 //     strictDenyRead suppresses those.
+//
+// The denyRead step is evaluated on the path as given and on its
+// symlink-resolved form, because the sandbox enforces on resolved paths.
 //
 // Dangerous-path protection is intentionally absent here: it is a write
 // concept (shell startup files stay readable, just not writable).
@@ -100,8 +105,11 @@ func CheckReadPath(path string, cwd string, cfg *config.Config) error {
 		return &PathBlockedError{Path: path, Op: PathOpRead, Reason: err.Error()}
 	}
 
-	if rule, ok := matchPathRule(clean, cfg.Filesystem.DenyRead); ok {
-		return &PathBlockedError{Path: clean, Op: PathOpRead, MatchedRule: rule, Reason: "denyRead"}
+	policy := newReadPolicy(cfg.Filesystem.AllowRead, cfg.Filesystem.DenyRead)
+	for _, spelling := range []string{clean, resolveExistingPrefix(clean)} {
+		if rule, denied := policy.deniedBy(spelling); denied {
+			return &PathBlockedError{Path: clean, Op: PathOpRead, MatchedRule: rule, Reason: "denyRead"}
+		}
 	}
 
 	// strictDenyRead implies defaultDenyRead; handle configs that were not
