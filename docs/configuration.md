@@ -327,7 +327,7 @@ Platform notes:
 
 - **macOS**: the other entries of the denied folder cannot be read or listed. The closed folders on the way to the carve-out can be stat-ed (existence, size, dates), because tools check each path component.
 - **Denied symlinks**: when a `denyRead` entry is a symlink, macOS also denies the link itself, so `readlink` and `ls -l` do not show where the folder really is. The link's name stays visible in its parent folder. If a carve-out sits below the link, the target is visible again: following a link and `readlink` need the same permission on macOS, and the carve-out has to stay reachable through the link. On Linux the target is hidden but the link itself stays readable, because a mount cannot be placed on a symlink.
-- **Linux**: the denied folder is replaced by an empty directory that contains only the carve-out, so other names are not listable. The carve-out is always read-only, even if it also matches `allowWrite`. The carve-out must exist when the sandbox starts: if it is missing while its denied folder exists, Fence refuses to start instead of silently dropping it.
+- **Linux**: the denied folder is replaced by an empty directory that contains only the carve-out, so other names are not listable. The carve-out is read-only unless `allowWrite` also covers it. The carve-out must exist when the sandbox starts: if it is missing while its denied folder exists, Fence refuses to start instead of silently dropping it.
 - `--expose-host-path` on macOS follows the same rule as `allowRead`: it reopens a path inside a denied folder, and loses to a `denyRead` entry on the same path or deeper. On Linux it is bound after every mask and always wins, which is unchanged. It is a launch-time override for callers that hand a specific file to the sandbox.
 
 > [!IMPORTANT]
@@ -358,7 +358,7 @@ Rules:
 Platform notes:
 
 - **Linux**: the carve-out must exist when the sandbox starts, because a missing path cannot be bound read-write. If it is missing, Fence prints a warning and starts; the path stays read-only and cannot be created inside the sandbox. On macOS a carve-out created later is writable.
-- **Linux**: a path that is both inside a `denyRead` folder and a write carve-out is not writable, unless it is also a read carve-out, in which case it is read-only.
+- **Folder denied for reads and writes**: an entry needs both `allowRead` and `allowWrite` to be usable. On Linux an `allowWrite` entry inside a `denyRead` folder stays hidden without the matching `allowRead`; on macOS it can be written but not read.
 
 > [!IMPORTANT]
 > **Behavior change**: before this rule existed, `denyWrite` always won. A config that already has a literal `allowWrite` path inside a `denyWrite` entry now makes that path writable.

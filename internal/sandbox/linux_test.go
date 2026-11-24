@@ -1465,6 +1465,11 @@ func linuxLateMountsWritable(t *testing.T, args []string, path string) bool {
 	writable := true
 	for i := 0; i < len(args); {
 		switch args[i] {
+		case "--tmpfs":
+			if pathContains(args[i+1], path) {
+				writable = false
+			}
+			i += 2
 		case "--ro-bind", "--bind":
 			if pathContains(args[i+2], path) {
 				writable = args[i] == "--bind"
@@ -1609,5 +1614,119 @@ func TestAppendLinuxLatePolicyMounts_MissingWriteCarveOutStaysReadOnly(t *testin
 	}
 	if linuxLateMountsWritable(t, args, in("d/missing")) {
 		t.Errorf("expected the missing carve-out to stay read-only; args=%q", args)
+	}
+}
+
+func TestLinuxLateMountPlanner_RevealAndWritableOnSamePathCombine(t *testing.T) {
+	for _, order := range [][]linuxLateMountKind{
+		{linuxLateMountReveal, linuxLateMountWritable},
+		{linuxLateMountWritable, linuxLateMountReveal},
+	} {
+		planner := newLinuxLateMountPlanner()
+		planner.Add("/root/secret", linuxLateMountMaskDir)
+		planner.Add("/root/secret", linuxLateMountReadOnly)
+		for _, kind := range order {
+			planner.Add("/root/secret/rw", kind)
+		}
+		planner.Add("/root/secret/rw/locked", linuxLateMountReadOnly)
+
+		want := []linuxLateMount{
+			{Path: "/root/secret", Kind: linuxLateMountMaskDir},
+			{Path: "/root/secret/rw", Kind: linuxLateMountRevealWritable},
+			{Path: "/root/secret/rw/locked", Kind: linuxLateMountReadOnly},
+		}
+		if got := planner.Mounts(); !slices.Equal(got, want) {
+			t.Fatalf("order %v: unexpected plan:\n got %#v\nwant %#v", order, got, want)
+		}
+	}
+}
+
+// A folder denied for reads and writes, with one entry reopened for both.
+func TestAppendLinuxLatePolicyMounts_WriteCarveOutInsideMaskedDirectory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := newCarveOutTree(t)
+	in := func(name string) string { return filepath.Join(root, name) }
+
+	tests := []struct {
+		name       string
+		filesystem config.FilesystemConfig
+		writable   []string
+		readOnly   []string
+	}{
+		{
+			name: "same path reopened for read and write",
+			filesystem: config.FilesystemConfig{
+				DenyRead:   []string{in("d")},
+				DenyWrite:  []string{in("d")},
+				AllowRead:  []string{in("d/sub")},
+				AllowWrite: []string{in("d/sub")},
+			},
+			writable: []string{in("d/sub/x")},
+		},
+		{
+			name: "revealed path under a broader allowWrite",
+			filesystem: config.FilesystemConfig{
+				DenyRead:   []string{in("d")},
+				AllowRead:  []string{in("d/sub")},
+				AllowWrite: []string{root},
+			},
+			writable: []string{in("d/sub/x")},
+		},
+		{
+			name: "allowWrite deeper than the revealed path",
+			filesystem: config.FilesystemConfig{
+				DenyRead:   []string{in("d")},
+				AllowRead:  []string{in("d/sub")},
+				AllowWrite: []string{in("d/sub/deep")},
+			},
+			writable: []string{in("d/sub/deep/y")},
+			readOnly: []string{in("d/sub/x")},
+		},
+		{
+			name: "revealed path without allowWrite stays read-only",
+			filesystem: config.FilesystemConfig{
+				DenyRead:  []string{in("d")},
+				AllowRead: []string{in("d/sub")},
+			},
+			readOnly: []string{in("d/sub/x")},
+		},
+		{
+			name: "denyWrite on the revealed path wins",
+			filesystem: config.FilesystemConfig{
+				DenyRead:   []string{in("d")},
+				DenyWrite:  []string{in("d/sub")},
+				AllowRead:  []string{in("d/sub")},
+				AllowWrite: []string{root},
+			},
+			readOnly: []string{in("d/sub/x")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{Filesystem: tt.filesystem}
+			args, err := appendLinuxLatePolicyMounts(nil, cfg, t.TempDir(), false, nil, false)
+			if err != nil {
+				t.Fatalf("appendLinuxLatePolicyMounts: %v", err)
+			}
+			for _, path := range append(slices.Clone(tt.writable), tt.readOnly...) {
+				if !linuxLateMountsExpose(t, args, path) {
+					t.Errorf("expected %s to be visible; args=%q", path, args)
+				}
+			}
+			for _, path := range tt.writable {
+				if !linuxLateMountsWritable(t, args, path) {
+					t.Errorf("expected %s to be writable; args=%q", path, args)
+				}
+			}
+			for _, path := range tt.readOnly {
+				if linuxLateMountsWritable(t, args, path) {
+					t.Errorf("expected %s to be read-only; args=%q", path, args)
+				}
+			}
+			if linuxLateMountsExpose(t, args, in("d/f")) {
+				t.Errorf("expected the rest of the masked folder to stay hidden; args=%q", args)
+			}
+		})
 	}
 }
