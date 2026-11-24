@@ -546,8 +546,9 @@ if err := fence.CheckWritePath(cfg, req.Path, req.CWD); err != nil {
 
 Semantics match wrap-mode enforcement:
 
-- **Writes**: mandatory dangerous-path protection, then `denyWrite`, then
-  `allowWrite`, then default deny. An empty policy denies all writes.
+- **Writes**: mandatory dangerous-path protection, then `denyWrite` (unless
+  a literal `allowWrite` path strictly inside the denied entry reopens it),
+  then `allowWrite`, then default deny. An empty policy denies all writes.
 - **Reads**: `denyRead` wins, unless a literal `allowRead` path strictly
   inside the denied entry reopens it (the most specific literal path wins,
   deny wins a tie; see
@@ -557,8 +558,8 @@ Semantics match wrap-mode enforcement:
   a default readable system path - unless `strictDenyRead` suppresses the
   system paths.
 
-Caveats: paths are evaluated lexically, except the `denyRead` step of
-`CheckReadPath`, which also checks the symlink-resolved path because that is
+Caveats: paths are evaluated lexically, except the `denyRead` and
+`denyWrite` steps, which also check the symlink-resolved path because that is
 what the sandbox enforces. Only the config is consulted -
 manager-level additions like `ExposeHostPath` are not reflected.
 

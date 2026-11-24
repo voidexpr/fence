@@ -8,43 +8,46 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 )
 
-// readRule is one allowRead or denyRead entry. For a literal entry, resolved
-// has symlinks resolved through the deepest existing ancestor, so a rule on a
-// path that does not exist yet still lands in the directory its parent links
-// to. For a glob entry, lexical and resolved are both the expanded pattern.
-type readRule struct {
+// pathRule is one allow or deny entry. For a literal entry, resolved has
+// symlinks resolved through the deepest existing ancestor, so a rule on a path
+// that does not exist yet still lands in the directory its parent links to.
+// For a glob entry, lexical and resolved are both the expanded pattern.
+type pathRule struct {
 	raw      string
 	lexical  string
 	resolved string
+	// linkPath is set when the last component of a literal entry is a
+	// symlink: the path of the link itself, as the kernel names it.
+	linkPath string
 }
 
-// readPolicy is the single source of read precedence between denyRead and
-// allowRead. The macOS profile generator, the Linux mount planner and
-// CheckReadPath all consult it, so they cannot disagree.
+// pathPolicy is the single source of precedence between a deny list and its
+// allow list: denyRead against allowRead, or denyWrite against allowWrite.
+// The macOS profile generator, the Linux mount planner and the CheckReadPath
+// / CheckWritePath predicates all consult it, so they cannot disagree.
 //
 // Precedence:
 //   - Among literal entries containing a path, the deepest one wins. On a tie
-//     denyRead wins. So a literal allowRead strictly inside a denyRead entry
-//     reopens its subtree (a carve-out), and a deeper denyRead closes part of
-//     it again.
-//   - A glob denyRead entry is reopened only by a literal allowRead that the
-//     glob itself matches, for that entry's subtree.
-//   - Glob allowRead entries never reopen anything.
-type readPolicy struct {
-	literalAllows []readRule
-	literalDenies []readRule
-	globDenies    []readRule
+//     deny wins. So a literal allow strictly inside a deny entry reopens its
+//     subtree (a carve-out), and a deeper deny closes part of it again.
+//   - A glob deny entry is reopened only by a literal allow that the glob
+//     itself matches, for that entry's subtree.
+//   - Glob allow entries never reopen anything.
+type pathPolicy struct {
+	literalAllows []pathRule
+	literalDenies []pathRule
+	globDenies    []pathRule
 }
 
-func newReadPolicy(allowRead, denyRead []string) *readPolicy {
-	p := &readPolicy{}
-	for _, raw := range allowRead {
-		if rule, glob, ok := newReadRule(raw); ok && !glob {
+func newPathPolicy(allow, deny []string) *pathPolicy {
+	p := &pathPolicy{}
+	for _, raw := range allow {
+		if rule, glob, ok := newPathRule(raw); ok && !glob {
 			p.literalAllows = append(p.literalAllows, rule)
 		}
 	}
-	for _, raw := range denyRead {
-		rule, glob, ok := newReadRule(raw)
+	for _, raw := range deny {
+		rule, glob, ok := newPathRule(raw)
 		switch {
 		case !ok:
 		case glob:
@@ -56,19 +59,24 @@ func newReadPolicy(allowRead, denyRead []string) *readPolicy {
 	return p
 }
 
-func newReadRule(raw string) (rule readRule, glob bool, ok bool) {
+func newPathRule(raw string) (rule pathRule, glob bool, ok bool) {
 	if raw == "" {
-		return readRule{}, false, false
+		return pathRule{}, false, false
 	}
 	lexical := expandPathPattern(raw)
 	if hasGlobMeta(lexical) || ContainsGlobChars(lexical) {
-		return readRule{raw: raw, lexical: lexical, resolved: lexical}, true, true
+		return pathRule{raw: raw, lexical: lexical, resolved: lexical}, true, true
 	}
 	lexical = filepath.Clean(lexical)
 	if !filepath.IsAbs(lexical) {
-		return readRule{}, false, false
+		return pathRule{}, false, false
 	}
-	return readRule{raw: raw, lexical: lexical, resolved: resolveExistingPrefix(lexical)}, false, true
+	rule = pathRule{raw: raw, lexical: lexical, resolved: resolveExistingPrefix(lexical)}
+	link := filepath.Join(resolveExistingPrefix(filepath.Dir(lexical)), filepath.Base(lexical))
+	if link != rule.resolved && isSymlink(link) {
+		rule.linkPath = link
+	}
+	return rule, false, true
 }
 
 // resolveExistingPrefix resolves symlinks in path. When path does not exist,
@@ -107,22 +115,22 @@ func pathDepth(path string) int {
 	return strings.Count(trimmed, string(filepath.Separator)) + 1
 }
 
-func (r readRule) contains(path string) bool {
+func (r pathRule) contains(path string) bool {
 	return pathContains(r.resolved, path) || pathContains(r.lexical, path)
 }
 
-func globMatches(glob readRule, path string) bool {
+func globMatches(glob pathRule, path string) bool {
 	matched, err := doublestar.Match(glob.lexical, path)
 	return err == nil && matched
 }
 
-func globMatchesRule(glob, rule readRule) bool {
+func globMatchesRule(glob, rule pathRule) bool {
 	return globMatches(glob, rule.resolved) || globMatches(glob, rule.lexical)
 }
 
-// deepestReadRule returns the deepest rule whose resolved path contains path.
-func deepestReadRule(rules []readRule, path string) (readRule, bool) {
-	var best readRule
+// deepestPathRule returns the deepest rule whose resolved path contains path.
+func deepestPathRule(rules []pathRule, path string) (pathRule, bool) {
+	var best pathRule
 	found := false
 	for _, rule := range rules {
 		if !pathContains(rule.resolved, path) {
@@ -135,9 +143,9 @@ func deepestReadRule(rules []readRule, path string) (readRule, bool) {
 	return best, found
 }
 
-// globReopenedAt reports whether a literal allowRead reopens glob for path:
+// globReopenedAt reports whether a literal allow reopens glob for path:
 // the glob matches the allow entry and the entry contains path.
-func (p *readPolicy) globReopenedAt(glob readRule, path string) bool {
+func (p *pathPolicy) globReopenedAt(glob pathRule, path string) bool {
 	for _, allow := range p.literalAllows {
 		if allow.contains(path) && globMatchesRule(glob, allow) {
 			return true
@@ -146,12 +154,12 @@ func (p *readPolicy) globReopenedAt(glob readRule, path string) bool {
 	return false
 }
 
-// deniedBy returns the denyRead entry (as written) that blocks path, if any.
+// deniedBy returns the deny entry (as written) that blocks path, if any.
 // path must be absolute and clean; callers that hold a symlinked spelling
 // should also ask about the resolved one.
-func (p *readPolicy) deniedBy(path string) (string, bool) {
-	if deny, ok := deepestReadRule(p.literalDenies, path); ok {
-		allow, reopened := deepestReadRule(p.literalAllows, path)
+func (p *pathPolicy) deniedBy(path string) (string, bool) {
+	if deny, ok := deepestPathRule(p.literalDenies, path); ok {
+		allow, reopened := deepestPathRule(p.literalAllows, path)
 		if !reopened || len(allow.resolved) <= len(deny.resolved) {
 			return deny.raw, true
 		}
@@ -164,21 +172,23 @@ func (p *readPolicy) deniedBy(path string) (string, bool) {
 	return "", false
 }
 
-// readCarveOut is a literal allowRead entry that reopens part of a denied
-// area.
-type readCarveOut struct {
+// pathCarveOut is a literal allow entry that reopens part of a denied area.
+type pathCarveOut struct {
 	raw  string
 	path string
-	// closedAncestors are the ancestors of path that stay denied. Tools need
-	// to stat them to reach path; they stay unlistable.
+	// closedAncestors are the ancestors of path that stay denied, plus the
+	// symlink a covering deny entry was given by. They must be stat-able to
+	// reach path, and they stay unlistable. For the symlink this has a cost:
+	// on macOS following a link and readlink need the same permission, so a
+	// carve-out below a denied link makes the link's target visible again.
 	closedAncestors []string
-	// residualGlobs are the denyRead globs that still apply inside path.
+	// residualGlobs are the deny globs that still apply inside path.
 	residualGlobs []string
 }
 
 // carveOuts returns the carve-outs ordered by depth, shallowest first.
-func (p *readPolicy) carveOuts() []readCarveOut {
-	var out []readCarveOut
+func (p *pathPolicy) carveOuts() []pathCarveOut {
+	var out []pathCarveOut
 	seen := make(map[string]bool)
 	for _, allow := range p.literalAllows {
 		if seen[allow.resolved] || !p.coveredByDeny(allow) {
@@ -189,13 +199,18 @@ func (p *readPolicy) carveOuts() []readCarveOut {
 		}
 		seen[allow.resolved] = true
 
-		carve := readCarveOut{raw: allow.raw, path: allow.resolved}
+		carve := pathCarveOut{raw: allow.raw, path: allow.resolved}
 		for dir := filepath.Dir(allow.resolved); ; dir = filepath.Dir(dir) {
 			if _, denied := p.deniedBy(dir); denied {
 				carve.closedAncestors = append(carve.closedAncestors, dir)
 			}
 			if dir == filepath.Dir(dir) {
 				break
+			}
+		}
+		for _, deny := range p.literalDenies {
+			if deny.linkPath != "" && pathContains(deny.resolved, allow.resolved) {
+				carve.closedAncestors = append(carve.closedAncestors, deny.linkPath)
 			}
 		}
 		for _, glob := range p.globDenies {
@@ -205,15 +220,15 @@ func (p *readPolicy) carveOuts() []readCarveOut {
 		}
 		out = append(out, carve)
 	}
-	slices.SortStableFunc(out, func(a, b readCarveOut) int {
+	slices.SortStableFunc(out, func(a, b pathCarveOut) int {
 		return pathDepth(a.path) - pathDepth(b.path)
 	})
 	return out
 }
 
-// coveredByDeny reports whether some denyRead entry would block allow if the
+// coveredByDeny reports whether some deny entry would block allow if the
 // allow entry were absent.
-func (p *readPolicy) coveredByDeny(allow readRule) bool {
+func (p *pathPolicy) coveredByDeny(allow pathRule) bool {
 	for _, deny := range p.literalDenies {
 		if deny.resolved != allow.resolved && pathContains(deny.resolved, allow.resolved) {
 			return true

@@ -44,10 +44,13 @@ type MacOSSandboxParams struct {
 	ReadAllowPaths          []string
 	ReadDenyPaths           []string
 	WriteAllowPaths         []string
-	WriteDenyPaths          []string
-	DeniedExecPaths         []string
-	AllowPty                bool
-	AllowGitConfig          bool
+	// WriteCarveOutPaths are the allow entries that may reopen a denyWrite
+	// path. Fence's default write paths are deliberately not among them.
+	WriteCarveOutPaths []string
+	WriteDenyPaths     []string
+	DeniedExecPaths    []string
+	AllowPty           bool
+	AllowGitConfig     bool
 }
 
 // GlobToRegex converts a glob pattern to a regex for macOS sandbox profiles.
@@ -300,22 +303,32 @@ func generateReadRules(defaultDenyRead, strictDenyRead bool, allowPaths, denyPat
 	// Block file movement to prevent bypass
 	generateMoveBlockingRules(builder, denyPaths, logTag)
 
-	return append(builder.rules, generateReadCarveOutRules(newReadPolicy(allowPaths, denyPaths), ops, logTag)...)
+	return append(builder.rules, generateReadCarveOutRules(newPathPolicy(allowPaths, denyPaths), ops, logTag)...)
 }
 
-// seatbeltReadSpellings is seatbeltPathSpellings plus, for a literal path that
-// does not exist yet, the spelling with its existing ancestors resolved. That
-// is the path readPolicy reasons about.
+// seatbeltReadSpellings is seatbeltPathSpellings plus two spellings of a
+// literal path: the one with its existing ancestors resolved when the path
+// does not exist yet (the path pathPolicy reasons about), and the symlink
+// itself when the entry is a link. Without the latter the link stays readable,
+// so readlink still shows where the denied folder really is.
 func seatbeltReadSpellings(pathPattern string) []string {
 	spellings := seatbeltPathSpellings(pathPattern)
-	if rule, glob, ok := newReadRule(pathPattern); ok && !glob {
-		for _, spelling := range expandMacOSPathAliases([]string{rule.resolved}) {
+	if rule, glob, ok := newPathRule(pathPattern); ok && !glob {
+		for _, spelling := range seatbeltRuleSpellings(rule) {
 			if !slices.Contains(spellings, spelling) {
 				spellings = append(spellings, spelling)
 			}
 		}
 	}
 	return spellings
+}
+
+func seatbeltRuleSpellings(rule pathRule) []string {
+	paths := []string{rule.resolved}
+	if rule.linkPath != "" {
+		paths = append(paths, rule.linkPath)
+	}
+	return expandMacOSPathAliases(paths)
 }
 
 func addSeatbeltReadDenyRules(builder *seatbeltRuleBuilder, normalized string, ops []string, logTag string) {
@@ -333,49 +346,66 @@ func addSeatbeltReadDenyRules(builder *seatbeltRuleBuilder, normalized string, o
 	}
 }
 
-// generateReadCarveOutRules emits the rules that reopen literal allowRead
-// paths inside denied areas. Seatbelt applies the last matching rule, so this
-// section comes after every plain deny and is ordered by path depth: a
-// carve-out overrides the shallower deny it sits in, and a deny nested inside
-// a carve-out is emitted again after it. The operations are the ones the deny
-// rules use, because a deny on a specific operation is only overridden by an
-// allow on that same operation.
-func generateReadCarveOutRules(policy *readPolicy, ops []string, logTag string) []string {
-	carveOuts := policy.carveOuts()
-	if len(carveOuts) == 0 {
-		return nil
-	}
+// carveOutStep is one entry of a carve-out section: a carve-out, or a literal
+// deny nested inside one.
+type carveOutStep struct {
+	path  string
+	carve *pathCarveOut
+	deny  pathRule
+}
 
-	type step struct {
-		path  string
-		carve *readCarveOut
-	}
-	var steps []step
+// carveOutSteps orders carve-outs and the literal denies nested in them by
+// path depth. Seatbelt applies the last matching rule, so a carve-out section
+// comes after every plain deny: a carve-out overrides the shallower deny it
+// sits in, and a deny nested inside a carve-out is emitted again after it.
+func carveOutSteps(policy *pathPolicy) []carveOutStep {
+	carveOuts := policy.carveOuts()
+	var steps []carveOutStep
 	for i := range carveOuts {
-		steps = append(steps, step{path: carveOuts[i].path, carve: &carveOuts[i]})
+		steps = append(steps, carveOutStep{path: carveOuts[i].path, carve: &carveOuts[i]})
 	}
 	for _, deny := range policy.literalDenies {
-		if slices.ContainsFunc(carveOuts, func(c readCarveOut) bool { return pathContains(c.path, deny.resolved) }) {
-			steps = append(steps, step{path: deny.resolved})
+		if slices.ContainsFunc(carveOuts, func(c pathCarveOut) bool { return pathContains(c.path, deny.resolved) }) {
+			steps = append(steps, carveOutStep{path: deny.resolved, deny: deny})
 		}
 	}
 	// Stable sort keeps a carve-out ahead of a deny of equal depth.
-	slices.SortStableFunc(steps, func(a, b step) int {
+	slices.SortStableFunc(steps, func(a, b carveOutStep) int {
 		return pathDepth(a.path) - pathDepth(b.path)
 	})
+	return steps
+}
 
+// addScopedGlobDenyRules denies op for the part of a glob that lies inside
+// subpath.
+func addScopedGlobDenyRules(builder *seatbeltRuleBuilder, ops []string, subpath, glob, logTag string) {
+	regex := strings.ReplaceAll(GlobToRegex(glob), `"`, `\"`)
+	for _, op := range ops {
+		builder.addRule(
+			fmt.Sprintf("(deny %s", op),
+			fmt.Sprintf("  (require-all (subpath %s) (regex #\"%s\"))", escapePath(subpath), regex),
+			fmt.Sprintf("  (with message %q))", logTag),
+		)
+	}
+}
+
+// generateReadCarveOutRules emits the rules that reopen literal allowRead
+// paths inside denied areas (see carveOutSteps for the ordering). The
+// operations are the ones the deny rules use, because a deny on a specific
+// operation is only overridden by an allow on that same operation.
+func generateReadCarveOutRules(policy *pathPolicy, ops []string, logTag string) []string {
 	// A fresh builder: a nested deny must be repeated here even though the
 	// same rule text already appears earlier in the profile.
 	builder := newSeatbeltRuleBuilder()
-	for _, s := range steps {
-		spellings := expandMacOSPathAliases([]string{s.path})
+	for _, s := range carveOutSteps(policy) {
 		if s.carve == nil {
-			for _, spelling := range spellings {
+			for _, spelling := range seatbeltRuleSpellings(s.deny) {
 				addSeatbeltReadDenyRules(builder, spelling, ops, logTag)
 			}
 			continue
 		}
 
+		spellings := expandMacOSPathAliases([]string{s.path})
 		for _, spelling := range spellings {
 			for _, op := range ops {
 				builder.addRule(
@@ -395,14 +425,7 @@ func generateReadCarveOutRules(policy *readPolicy, ops []string, logTag string) 
 		// Glob denies the carve-out does not reopen keep applying inside it.
 		for _, spelling := range spellings {
 			for _, glob := range expandMacOSPathAliases(s.carve.residualGlobs) {
-				regex := strings.ReplaceAll(GlobToRegex(glob), `"`, `\"`)
-				for _, op := range ops {
-					builder.addRule(
-						fmt.Sprintf("(deny %s", op),
-						fmt.Sprintf("  (require-all (subpath %s) (regex #\"%s\"))", escapePath(spelling), regex),
-						fmt.Sprintf("  (with message %q))", logTag),
-					)
-				}
+				addScopedGlobDenyRules(builder, ops, spelling, glob, logTag)
 			}
 		}
 	}
@@ -410,7 +433,9 @@ func generateReadCarveOutRules(policy *readPolicy, ops []string, logTag string) 
 }
 
 // generateWriteRules generates filesystem write rules for the sandbox profile.
-func generateWriteRules(allowPaths, denyPaths []string, allowGitConfig bool, workingDir, logTag string) []string {
+// carveOutPaths are the allow entries that may reopen a denyWrite path: the
+// user's allowWrite, without Fence's default write paths.
+func generateWriteRules(allowPaths, carveOutPaths, denyPaths []string, allowGitConfig bool, workingDir, logTag string) []string {
 	builder := newSeatbeltRuleBuilder()
 
 	// Allow TMPDIR parent on macOS
@@ -448,7 +473,16 @@ func generateWriteRules(allowPaths, denyPaths []string, allowGitConfig bool, wor
 	allDenyPaths = append(allDenyPaths, denyPaths...)
 	allDenyPaths = append(allDenyPaths, mandatoryDeny...)
 
-	for _, pathPattern := range allDenyPaths {
+	addSeatbeltWriteDenyRules(builder, allDenyPaths, logTag)
+
+	// Block file movement
+	generateMoveBlockingRules(builder, allDenyPaths, logTag)
+
+	return append(builder.rules, generateWriteCarveOutRules(newPathPolicy(carveOutPaths, denyPaths), mandatoryDeny, logTag)...)
+}
+
+func addSeatbeltWriteDenyRules(builder *seatbeltRuleBuilder, pathPatterns []string, logTag string) {
+	for _, pathPattern := range pathPatterns {
 		// Emit both /tmp and /private/tmp spellings so the deny matches the
 		// kernel-resolved path (see seatbeltPathSpellings).
 		for _, normalized := range seatbeltPathSpellings(pathPattern) {
@@ -464,10 +498,49 @@ func generateWriteRules(allowPaths, denyPaths []string, allowGitConfig bool, wor
 			}
 		}
 	}
+}
 
-	// Block file movement
-	generateMoveBlockingRules(builder, allDenyPaths, logTag)
+// generateWriteCarveOutRules emits the rules that reopen literal allowWrite
+// paths inside denyWrite areas (see carveOutSteps for the ordering). Each
+// carve-out also gets file-write-unlink back, which the move-blocking rules of
+// the covering deny took away; without it nothing inside could be deleted or
+// renamed. The mandatory dangerous-path denies are repeated at the end, so a
+// carve-out never reopens them.
+func generateWriteCarveOutRules(policy *pathPolicy, mandatoryDeny []string, logTag string) []string {
+	steps := carveOutSteps(policy)
+	if len(steps) == 0 {
+		return nil
+	}
 
+	ops := []string{"file-write*", "file-write-unlink"}
+	builder := newSeatbeltRuleBuilder()
+	for _, s := range steps {
+		if s.carve == nil {
+			nested := []string{s.deny.raw}
+			addSeatbeltWriteDenyRules(builder, nested, logTag)
+			generateMoveBlockingRules(builder, nested, logTag)
+			continue
+		}
+
+		spellings := expandMacOSPathAliases([]string{s.path})
+		for _, spelling := range spellings {
+			for _, op := range ops {
+				builder.addRule(
+					fmt.Sprintf("(allow %s", op),
+					fmt.Sprintf("  (subpath %s)", escapePath(spelling)),
+					fmt.Sprintf("  (with message %q))", logTag),
+				)
+			}
+		}
+		for _, spelling := range spellings {
+			for _, glob := range expandMacOSPathAliases(s.carve.residualGlobs) {
+				addScopedGlobDenyRules(builder, ops, spelling, glob, logTag)
+			}
+		}
+	}
+
+	addSeatbeltWriteDenyRules(builder, mandatoryDeny, logTag)
+	generateMoveBlockingRules(builder, mandatoryDeny, logTag)
 	return builder.rules
 }
 
@@ -769,7 +842,7 @@ func GenerateSandboxProfile(params MacOSSandboxParams) string {
 
 	// Write rules
 	profile.WriteString("; File write\n")
-	for _, rule := range generateWriteRules(params.WriteAllowPaths, params.WriteDenyPaths, params.AllowGitConfig, params.WorkingDirectory, logTag) {
+	for _, rule := range generateWriteRules(params.WriteAllowPaths, params.WriteCarveOutPaths, params.WriteDenyPaths, params.AllowGitConfig, params.WorkingDirectory, logTag) {
 		profile.WriteString(rule + "\n")
 	}
 
@@ -821,6 +894,7 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 	// confusing downstream failure when the sandboxed process can't find
 	// the file.
 	readExposed := append([]string{}, cfg.Filesystem.AllowRead...)
+	writeCarveOuts := append([]string{}, cfg.Filesystem.AllowWrite...)
 	for _, ehp := range exposedHostPaths {
 		if !fileExists(ehp.path) {
 			fencelog.Printf("[fence:macos] ExposeHostPath: skipping %q (does not exist on host at sandbox-launch time)\n", ehp.path)
@@ -829,6 +903,7 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 		readExposed = append(readExposed, ehp.path)
 		if ehp.writable {
 			allowPaths = append(allowPaths, ehp.path)
+			writeCarveOuts = append(writeCarveOuts, ehp.path)
 		}
 	}
 
@@ -889,6 +964,7 @@ func WrapCommandMacOS(cfg *config.Config, command string, workingDir string, htt
 		ReadAllowPaths:          readExposed,
 		ReadDenyPaths:           cfg.Filesystem.DenyRead,
 		WriteAllowPaths:         allowPaths,
+		WriteCarveOutPaths:      writeCarveOuts,
 		WriteDenyPaths:          cfg.Filesystem.DenyWrite,
 		DeniedExecPaths:         deniedExecPaths,
 		AllowPty:                cfg.AllowPty,

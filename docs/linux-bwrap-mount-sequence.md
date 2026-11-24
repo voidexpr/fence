@@ -331,6 +331,20 @@ Each denied write path is re-mounted with:
 This phase is deliberately late so it can tighten paths that may have become
 writable earlier through `allowWrite`.
 
+A literal `allowWrite` path strictly inside a `denyWrite` directory is a
+carve-out. Fence binds it read-write again after the read-only bind that
+covers it, and a `denyWrite` entry nested inside it is applied after that:
+
+```text
+--ro-bind .ateam .ateam
+--bind .ateam/state .ateam/state
+--ro-bind .ateam/state/locked .ateam/state/locked
+```
+
+Mandatory dangerous-path protection is not reopened this way. A carve-out
+that does not exist at launch cannot be bound: Fence warns and leaves it
+read-only.
+
 ### 12. Runtime Executable Deny
 
 Fence then masks selected executable paths with:

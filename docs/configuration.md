@@ -266,8 +266,8 @@ If you're unsure which services a tool needs, run with `-m` to surface blocked
 | `defaultDenyRead` | If true, deny all filesystem reads by default. Only paths listed in `allowRead` (and essential system paths) remain readable. Use for strict read isolation. |
 | `strictDenyRead` | If true, suppress the default readable system paths that are normally added when `defaultDenyRead` is enabled. Only paths in `allowRead` will be readable. Implies `defaultDenyRead`. |
 | `denyRead` | Paths to deny reading. Wins over `allowRead`, except for a more specific literal `allowRead` path, see [Read precedence](#read-precedence-and-carve-outs). |
-| `allowWrite` | Paths to allow writing (also grants read and execute) |
-| `denyWrite` | Paths to deny writing (takes precedence) |
+| `allowWrite` | Paths to allow writing (also grants read and execute). A literal path strictly inside a `denyWrite` entry stays writable, see [Write carve-outs](#write-carve-outs). |
+| `denyWrite` | Paths to deny writing. Wins over `allowWrite`, except for a more specific literal `allowWrite` path, see [Write carve-outs](#write-carve-outs). |
 | `allowGitConfig` | Allow writes to `.git/config` files |
 
 ### Permission Tiers
@@ -312,7 +312,7 @@ Rules:
 - A glob `allowRead` entry never reopens a denied path.
 - A glob `denyRead` entry is reopened by a literal `allowRead` path that the glob itself matches (`denyRead: ["~/.ssh/**"]`, `allowRead: ["~/.ssh/config"]`). A glob that does not match the `allowRead` path keeps applying inside it (`denyRead: ["**/*.pem"]` still hides `.pem` files in a reopened directory).
 - The rules are the same with and without `defaultDenyRead` / `strictDenyRead`.
-- Write rules do not change. A carve-out grants read only.
+- A read carve-out grants read only. Writes have their own carve-outs, see [Write carve-outs](#write-carve-outs).
 - Symlinks are resolved first, so a denied folder that is a link (`~/.ssh` -> `~/Sync/.ssh`) works whether each entry uses the link name or the target.
 
 The same rules can be given on the command line, with no config change:
@@ -326,11 +326,42 @@ fence --deny-read ~/.ssh --allow-read ~/.ssh/config -- cat ~/.ssh/config
 Platform notes:
 
 - **macOS**: the other entries of the denied folder cannot be read or listed. The closed folders on the way to the carve-out can be stat-ed (existence, size, dates), because tools check each path component.
+- **Denied symlinks**: when a `denyRead` entry is a symlink, macOS also denies the link itself, so `readlink` and `ls -l` do not show where the folder really is. The link's name stays visible in its parent folder. If a carve-out sits below the link, the target is visible again: following a link and `readlink` need the same permission on macOS, and the carve-out has to stay reachable through the link. On Linux the target is hidden but the link itself stays readable, because a mount cannot be placed on a symlink.
 - **Linux**: the denied folder is replaced by an empty directory that contains only the carve-out, so other names are not listable. The carve-out is always read-only, even if it also matches `allowWrite`. The carve-out must exist when the sandbox starts: if it is missing while its denied folder exists, Fence refuses to start instead of silently dropping it.
 - `--expose-host-path` on macOS follows the same rule as `allowRead`: it reopens a path inside a denied folder, and loses to a `denyRead` entry on the same path or deeper. On Linux it is bound after every mask and always wins, which is unchanged. It is a launch-time override for callers that hand a specific file to the sandbox.
 
 > [!IMPORTANT]
 > **Behavior change**: before this rule existed, `denyRead` always won. A config that already has a literal `allowRead` path inside a `denyRead` entry now exposes that path. Check existing configs for such pairs.
+
+### Write carve-outs
+
+Writes follow the same precedence. A literal `allowWrite` path strictly inside a `denyWrite` entry stays writable, and the rest of the denied folder stays read-only.
+
+```json
+{
+  "filesystem": {
+    "allowWrite": [".", ".ateam/state"],
+    "denyWrite": [".ateam"]
+  }
+}
+```
+
+`.ateam/state` is writable. Nothing else in `.ateam` can be changed, created, deleted or renamed, and `.ateam` itself cannot be moved away.
+
+Rules:
+
+- The rules are the ones listed for reads: the most specific literal path wins, `denyWrite` wins a tie, nesting works to any depth, globs in `allowWrite` never reopen, and a glob `denyWrite` is reopened only by a literal `allowWrite` path the glob matches.
+- Files inside a carve-out can be deleted and renamed.
+- Mandatory dangerous-path protection is never reopened. A shell startup file or `.git/hooks` inside a carve-out stays read-only.
+- Only `allowWrite` entries (and `--expose-host-path-rw` on macOS) reopen a `denyWrite` path. Fence's built-in default write paths do not.
+
+Platform notes:
+
+- **Linux**: the carve-out must exist when the sandbox starts, because a missing path cannot be bound read-write. If it is missing, Fence prints a warning and starts; the path stays read-only and cannot be created inside the sandbox. On macOS a carve-out created later is writable.
+- **Linux**: a path that is both inside a `denyRead` folder and a write carve-out is not writable, unless it is also a read carve-out, in which case it is read-only.
+
+> [!IMPORTANT]
+> **Behavior change**: before this rule existed, `denyWrite` always won. A config that already has a literal `allowWrite` path inside a `denyWrite` entry now makes that path writable.
 
 ### WSL (Windows Subsystem for Linux) Example
 

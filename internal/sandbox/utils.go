@@ -21,6 +21,15 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// isSymlink returns true if the path is a symbolic link.
+func isSymlink(path string) bool {
+	info, err := os.Lstat(path) // Lstat doesn't follow symlinks
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeSymlink != 0
+}
+
 // ContainsGlobChars checks if a path pattern contains glob characters.
 func ContainsGlobChars(pattern string) bool {
 	return strings.ContainsAny(pattern, "*?[]")

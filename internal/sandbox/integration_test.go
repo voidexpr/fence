@@ -695,3 +695,72 @@ func TestIntegration_ReadCarveOutThroughSymlink(t *testing.T) {
 		}
 	}
 }
+
+// TestIntegration_WriteCarveOut launches a real sandbox to check that a
+// literal allowWrite path inside a denyWrite folder stays writable, and that
+// nothing else in the folder does.
+func TestIntegration_WriteCarveOut(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	workspace := createTempWorkspace(t)
+	lockedDir := filepath.Join(workspace, "locked")
+	existing := createTestFile(t, lockedDir, "open/existing.txt", "old content")
+	removable := createTestFile(t, lockedDir, "open/removable.txt", "to delete")
+	sibling := createTestFile(t, lockedDir, "sibling.txt", "sibling content")
+	closedAgain := createTestFile(t, lockedDir, "open/closed/file.txt", "closed content")
+	openDir := filepath.Join(lockedDir, "open")
+
+	cfg := testConfigWithWorkspace(workspace)
+	cfg.Filesystem.DenyWrite = []string{lockedDir, filepath.Join(openDir, "closed")}
+	cfg.Filesystem.AllowWrite = append(cfg.Filesystem.AllowWrite, openDir)
+
+	created := filepath.Join(openDir, "created.txt")
+	assertAllowed(t, runUnderSandbox(t, cfg, "echo new > "+created, workspace))
+	assertFileExists(t, created)
+
+	assertAllowed(t, runUnderSandbox(t, cfg, "echo changed > "+existing, workspace))
+	content, err := os.ReadFile(existing) //nolint:gosec
+	if err != nil || strings.TrimSpace(string(content)) != "changed" {
+		t.Errorf("expected the carved file to change, got %q, %v", content, err)
+	}
+
+	// Files in the carve-out can be deleted and renamed.
+	assertAllowed(t, runUnderSandbox(t, cfg, "rm "+removable, workspace))
+	assertFileNotExists(t, removable)
+	assertAllowed(t, runUnderSandbox(t, cfg, "mv "+created+" "+filepath.Join(openDir, "renamed.txt"), workspace))
+
+	// The rest of the denied folder stays closed: no change, nothing planted.
+	assertBlocked(t, runUnderSandbox(t, cfg, "echo changed > "+sibling, workspace))
+	planted := filepath.Join(lockedDir, "planted.txt")
+	assertBlocked(t, runUnderSandbox(t, cfg, "touch "+planted, workspace))
+	assertFileNotExists(t, planted)
+	assertBlocked(t, runUnderSandbox(t, cfg, "rm "+sibling, workspace))
+	assertFileExists(t, sibling)
+
+	// A deny nested in the carve-out closes it again.
+	assertBlocked(t, runUnderSandbox(t, cfg, "echo changed > "+closedAgain, workspace))
+
+	// Neither the denied folder nor the carve-out's parent chain can be moved.
+	assertBlocked(t, runUnderSandbox(t, cfg, "mv "+lockedDir+" "+filepath.Join(workspace, "moved"), workspace))
+	assertFileExists(t, sibling)
+}
+
+// TestIntegration_WriteCarveOutKeepsDangerousFilesProtected checks that
+// mandatory protection still applies inside a write carve-out.
+func TestIntegration_WriteCarveOutKeepsDangerousFilesProtected(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	workspace := createTempWorkspace(t)
+	lockedDir := filepath.Join(workspace, "locked")
+	bashrc := createTestFile(t, lockedDir, "open/.bashrc", "safe")
+
+	cfg := testConfigWithWorkspace(workspace)
+	cfg.Filesystem.DenyWrite = []string{lockedDir}
+	cfg.Filesystem.AllowWrite = append(cfg.Filesystem.AllowWrite, filepath.Join(lockedDir, "open"))
+
+	assertBlocked(t, runUnderSandbox(t, cfg, "echo malicious > "+bashrc, workspace))
+	content, err := os.ReadFile(bashrc) //nolint:gosec
+	if err != nil || string(content) != "safe" {
+		t.Errorf("dangerous file changed inside the carve-out: %q, %v", content, err)
+	}
+}

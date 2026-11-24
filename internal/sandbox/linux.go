@@ -634,15 +634,6 @@ func isDirectory(path string) bool {
 	return info.IsDir()
 }
 
-// isSymlink returns true if the path is a symbolic link.
-func isSymlink(path string) bool {
-	info, err := os.Lstat(path) // Lstat doesn't follow symlinks
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeSymlink != 0
-}
-
 // resolvePathForMount canonicalizes a path before mounting over it.
 // bubblewrap can fail when destination paths include symlink components
 // (common on usr-merged distros, e.g. /bin -> /usr/bin), so always prefer the

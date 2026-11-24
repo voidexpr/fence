@@ -189,8 +189,10 @@ func CheckReadPath(cfg *Config, path, cwd string) error {
 // *PathBlockedError describing why it is denied.
 //
 // Precedence matches wrap-mode enforcement: mandatory dangerous-path
-// protection, then denyWrite, then allowWrite, then default deny. Like
-// CheckReadPath, this is a policy preflight, not enforcement.
+// protection, then denyWrite, then allowWrite, then default deny. A literal
+// allowWrite path strictly inside a denyWrite entry reopens it; denyWrite
+// wins a tie and a dangerous path is never reopened. Like CheckReadPath,
+// this is a policy preflight, not enforcement.
 //
 // Relative paths resolve against cwd; pass "" to require absolute paths.
 func CheckWritePath(cfg *Config, path, cwd string) error {
