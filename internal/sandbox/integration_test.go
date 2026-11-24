@@ -764,3 +764,44 @@ func TestIntegration_WriteCarveOutKeepsDangerousFilesProtected(t *testing.T) {
 		t.Errorf("dangerous file changed inside the carve-out: %q, %v", content, err)
 	}
 }
+
+// TestIntegration_ReadWriteCarveOutInsideExcludedFolder covers a folder that
+// is denied for both reads and writes, with one entry reopened for both.
+func TestIntegration_ReadWriteCarveOutInsideExcludedFolder(t *testing.T) {
+	skipIfAlreadySandboxed(t)
+
+	workspace := createTempWorkspace(t)
+	secretDir := filepath.Join(workspace, "secret")
+	openDir := filepath.Join(secretDir, "rw")
+	existing := createTestFile(t, openDir, "existing.txt", "old content")
+	sibling := createTestFile(t, secretDir, "id_key", "sibling content")
+
+	cfg := testConfigWithWorkspace(workspace)
+	cfg.Filesystem.DenyRead = []string{secretDir}
+	cfg.Filesystem.DenyWrite = []string{secretDir}
+	cfg.Filesystem.AllowRead = []string{openDir}
+	cfg.Filesystem.AllowWrite = append(cfg.Filesystem.AllowWrite, openDir)
+
+	result := runUnderSandbox(t, cfg, "cat "+existing, workspace)
+	assertAllowed(t, result)
+	assertContains(t, result.Stdout, "old content")
+
+	created := filepath.Join(openDir, "created.txt")
+	assertAllowed(t, runUnderSandbox(t, cfg, "echo new > "+created, workspace))
+	assertFileExists(t, created)
+	assertAllowed(t, runUnderSandbox(t, cfg, "rm "+existing, workspace))
+	assertFileNotExists(t, existing)
+
+	assertBlocked(t, runUnderSandbox(t, cfg, "cat "+sibling, workspace))
+
+	// On Linux the masked folder is an empty scratch directory, so a write
+	// there can succeed inside the sandbox. What matters is the host.
+	_ = runUnderSandbox(t, cfg, "echo changed > "+sibling, workspace)
+	content, err := os.ReadFile(sibling) //nolint:gosec
+	if err != nil || string(content) != "sibling content" {
+		t.Errorf("sibling changed on the host: %q, %v", content, err)
+	}
+	planted := filepath.Join(secretDir, "planted.txt")
+	_ = runUnderSandbox(t, cfg, "touch "+planted, workspace)
+	assertFileNotExists(t, planted)
+}

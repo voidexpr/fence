@@ -276,7 +276,9 @@ inside a carve-out is masked again after the reveal:
 --tmpfs ~/.ssh/keys/private
 ```
 
-bwrap creates the missing parent directories of a reveal inside the tmpfs. A
+A revealed path that `allowWrite` also covers is bound with `--bind` instead,
+so it stays writable. bwrap creates the missing parent directories of a reveal
+inside the tmpfs. A
 carve-out that does not exist at launch cannot be bound, so Fence refuses to
 start when its denied directory exists.
 
