@@ -641,27 +641,6 @@ func TestMacOS_DenyReadGivenByLinkHidesTheLinkTarget(t *testing.T) {
 	}
 }
 
-// nonLoopbackIPv4 returns an address of this machine that is not loopback, so
-// a test can check a non-localhost destination without the public internet.
-func nonLoopbackIPv4(t *testing.T) string {
-	t.Helper()
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		t.Fatalf("failed to list interface addresses: %v", err)
-	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
-			continue
-		}
-		if ip4 := ipNet.IP.To4(); ip4 != nil {
-			return ip4.String()
-		}
-	}
-	t.Skip("skipping: no non-loopback IPv4 address on this machine")
-	return ""
-}
-
 func listenTCP(t *testing.T, host string) (port string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
@@ -675,12 +654,16 @@ func listenTCP(t *testing.T, host string) (port string) {
 // TestMacOS_LocalOutboundDoesNotAllowOtherDestinations verifies that
 // allowLocalOutbound opens localhost only. A direct connection to any other
 // address must stay blocked, or the domain allowlist is not a boundary.
+//
+// The other destination is 192.0.2.1, a documentation address that is never
+// routed, so the test needs no internet. Seatbelt must refuse the connection
+// itself: without the sandbox the attempt would time out instead. This
+// machine's own LAN address cannot be used, because Seatbelt counts every
+// local interface address as "localhost".
 func TestMacOS_LocalOutboundDoesNotAllowOtherDestinations(t *testing.T) {
 	skipIfAlreadySandboxed(t)
 	skipIfCommandNotFound(t, "nc")
 
-	otherIP := nonLoopbackIPv4(t)
-	otherPort := listenTCP(t, otherIP)
 	localPort := listenTCP(t, "127.0.0.1")
 
 	workspace := createTempWorkspace(t)
@@ -691,6 +674,9 @@ func TestMacOS_LocalOutboundDoesNotAllowOtherDestinations(t *testing.T) {
 	result := runUnderSandboxWithTimeout(t, cfg, "nc -z -w 2 127.0.0.1 "+localPort, workspace, 10*time.Second)
 	assertAllowed(t, result)
 
-	result = runUnderSandboxWithTimeout(t, cfg, "nc -z -w 2 "+otherIP+" "+otherPort, workspace, 10*time.Second)
+	result = runUnderSandboxWithTimeout(t, cfg, "nc -v -z -w 2 192.0.2.1 443", workspace, 10*time.Second)
 	assertBlocked(t, result)
+	if !strings.Contains(result.Stdout+result.Stderr, "not permitted") {
+		t.Errorf("expected the sandbox to refuse the connection, got:\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)
+	}
 }
