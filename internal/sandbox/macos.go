@@ -616,9 +616,12 @@ func GenerateSandboxProfile(params MacOSSandboxParams) string {
 			profile.WriteString(`(allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
 `)
-			// Process can make outbound connections to localhost
+			// Process can make outbound connections to localhost. The filter
+			// must be on the remote end: "local ip" names the socket's own
+			// address, which an unbound outgoing socket also matches, so it
+			// would allow connections to any destination.
 			if params.AllowLocalOutbound {
-				profile.WriteString(`(allow network-outbound (local ip "localhost:*"))
+				profile.WriteString(`(allow network-outbound (remote ip "localhost:*"))
 `)
 			}
 		}

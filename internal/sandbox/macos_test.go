@@ -1216,3 +1216,23 @@ func TestWrapCommandMacOS_ExposedHostPathsSkipsMissing(t *testing.T) {
 		t.Errorf("existing exposed host path %q should appear in seatbelt profile, got:\n%s", goodResolved, cmd)
 	}
 }
+
+// The localhost outbound rule must filter on the destination. A "local ip"
+// filter names the socket's own end and lets a process connect anywhere.
+func TestMacOS_LocalOutboundRuleFiltersOnRemoteAddress(t *testing.T) {
+	cfg := &config.Config{
+		Network: config.NetworkConfig{
+			AllowedDomains:    []string{"example.com"},
+			AllowLocalBinding: true,
+		},
+	}
+
+	profile := GenerateSandboxProfile(buildMacOSParamsForTest(cfg))
+
+	if !strings.Contains(profile, `(allow network-outbound (remote ip "localhost:*"))`) {
+		t.Errorf("expected localhost outbound rule on the remote address, got:\n%s", profile)
+	}
+	if strings.Contains(profile, "(allow network-outbound (local ip") {
+		t.Errorf("outbound rule must not filter on the local address, got:\n%s", profile)
+	}
+}
